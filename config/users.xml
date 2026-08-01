@@ -1,0 +1,64 @@
+<clickhouse replace="true">
+    <profiles>
+        <default>
+            <!-- 4 CPU / ~5 GiB ClickHouse cgroup: 2 GiB per query, 3.5 GiB/user.
+                 max_server_memory_usage_to_ram_ratio in config.xml caps the server. -->
+            <max_memory_usage>2147483648</max_memory_usage> <!-- 2 GiB -->
+            <max_memory_usage_for_user>3758096384</max_memory_usage_for_user> <!-- 3.5 GiB -->
+            <!-- Kill runaway queries after 15 minutes -->
+            <max_execution_time>900</max_execution_time>
+            <!-- 26.7 blocks S3 access from user SQL that falls back to the server's
+                 own ambient credentials (env/IMDS/instance profile). Keep enabled
+                 for parity with the pinned 26.7 image. -->
+            <s3_allow_server_credentials_in_user_queries>1</s3_allow_server_credentials_in_user_queries>
+            <max_concurrent_queries_for_user>20</max_concurrent_queries_for_user>
+            <use_uncompressed_cache>1</use_uncompressed_cache>
+            <prefer_localhost_replica>0</prefer_localhost_replica>
+            <!-- Spill to disk at ~half the per-query limit. -->
+            <max_bytes_before_external_group_by>1073741824</max_bytes_before_external_group_by> <!-- 1 GiB -->
+            <max_bytes_before_external_sort>1073741824</max_bytes_before_external_sort> <!-- 1 GiB -->
+            <query_cache_system_table_handling>ignore</query_cache_system_table_handling>
+            <log_queries>1</log_queries>
+        </default>
+    </profiles>
+
+    <users>
+        <default replace="replace">
+            <access_management>1</access_management>
+            <password_sha256_hex>e5ce256cdc2491e0e6b38abef0ccc58df3158c03203188518dabe4d4279e674f</password_sha256_hex>
+            <profile>default</profile>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <quota>default</quota>
+            <named_collection_control>1</named_collection_control>
+            <show_named_collections>1</show_named_collections>
+            <show_named_collections_secrets>0</show_named_collections_secrets>
+        </default>
+    </users>
+
+    <quotas>
+        <default>
+            <!-- 1-minute window: cap queries to prevent flood. 3000/60s matches
+                 the original intent; the previous 300 was one order of magnitude
+                 below observed normal traffic (root alone runs ~60k queries/day). -->
+            <interval>
+                <duration>60</duration>
+                <queries>3000</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+            <!-- Keep hourly limit unrestricted for normal usage -->
+            <interval>
+                <duration>3600</duration>
+                <queries>0</queries>
+                <errors>0</errors>
+                <result_rows>0</result_rows>
+                <read_rows>0</read_rows>
+                <execution_time>0</execution_time>
+            </interval>
+        </default>
+    </quotas>
+</clickhouse>

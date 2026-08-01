@@ -1,0 +1,4 @@
+.env
+clickhouse_data/
+clickhouse_logs/
+hyperdx_mongo_data/

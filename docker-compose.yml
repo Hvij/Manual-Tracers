@@ -1,0 +1,74 @@
+services:
+  clickhouse:
+    # Pinned, not :latest. s3_allow_server_credentials_in_user_queries in
+    # users.xml only exists from 26.7 - on an older image the server refuses to
+    # start with UNKNOWN_SETTING, so an unpinned tag can turn a routine pull
+    # into a hard startup failure. Bump this deliberately.
+    image: clickhouse/clickhouse-server:26.7
+    container_name: clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native client
+      - "9004:9004"   # mysql client
+      - "9005:9005"   # postgres client
+      - "9363:9363"   # Prometheus metrics
+    env_file: .env
+    volumes:
+      - ./config/config.xml:/etc/clickhouse-server/config.d/config.xml
+      - ./config/users.xml:/etc/clickhouse-server/users.d/users.xml
+      - ./config/storage.xml:/etc/clickhouse-server/config.d/storage.xml
+      - ./clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse_logs:/var/log/clickhouse-server
+      - ./InMobi/data:/var/lib/clickhouse/user_files/inmobi:ro
+    # Sized for a 4 CPU / 8 GB host that also runs HyperDX + Mongo.
+    # Prefer mem_limit/cpus (Compose Desktop) over Swarm-only deploy.resources.
+    mem_limit: 5g
+    cpus: 3.0
+    deploy:
+      resources:
+        limits:
+          memory: 5G
+          cpus: "3.0"
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--user", "default", "--password", "asdfzxcv", "--query", "SELECT 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    restart: unless-stopped
+
+  # HyperDX OSS — UI/API only; reuses the clickhouse service above (no 2nd CH).
+  # Docs: https://clickhouse.com/docs/use-cases/observability/clickstack/deployment/hyperdx-only
+  hyperdx-mongo:
+    image: mongo:5.0.32-focal
+    container_name: hyperdx-mongo
+    volumes:
+      - ./hyperdx_mongo_data:/data/db
+    mem_limit: 512m
+    cpus: 0.5
+    restart: unless-stopped
+
+  hyperdx:
+    image: docker.hyperdx.io/hyperdx/hyperdx:2
+    container_name: hyperdx
+    ports:
+      - "8080:8080"   # UI
+      - "8000:8000"   # API
+    environment:
+      HYPERDX_API_PORT: "8000"
+      HYPERDX_APP_PORT: "8080"
+      HYPERDX_APP_URL: "http://localhost"
+      HYPERDX_LOG_LEVEL: "info"
+      MONGO_URI: "mongodb://hyperdx-mongo:27017/hyperdx"
+      # Pre-seed connection to compose ClickHouse (HTTP). Host must be the
+      # docker DNS name — HyperDX API queries from inside the network.
+      DEFAULT_CONNECTIONS: >-
+        [{"name":"Local ClickHouse","host":"http://clickhouse:8123","username":"${CLICKHOUSE_USER}","password":"${CLICKHOUSE_PASSWORD}"}]
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      hyperdx-mongo:
+        condition: service_started
+    mem_limit: 1.5g
+    cpus: 0.5
+    restart: unless-stopped
