@@ -1,0 +1,21 @@
+services:
+  rca-api:
+    build: ./rca-api
+    container_name: rca-api
+    environment:
+      RCA_API_PORT: "3002"
+    ports:
+      - "3002:3002"
+    restart: unless-stopped
+
+  rca-ui:
+    build:
+      context: ./rca-ui
+      args:
+        VITE_RCA_API_URL: ""
+    container_name: rca-ui
+    ports:
+      - "8090:80"
+    depends_on:
+      - rca-api
+    restart: unless-stopped

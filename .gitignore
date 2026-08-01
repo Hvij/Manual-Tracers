@@ -2,6 +2,9 @@
 clickhouse_data/
 clickhouse_logs/
 hyperdx_mongo_data/
+rca-api/node_modules/
+rca-ui/node_modules/
+rca-ui/dist/
 
 # local runtime
 __wtest

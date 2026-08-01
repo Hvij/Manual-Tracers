@@ -41,6 +41,19 @@ Modes: `--schema` (DDL only) · `--data` (replay only) · `--dims` (reload dimen
 cd RCA && uv run pytest -q                  # 39 tests, no ClickHouse needed
 ```
 
+## RCA viewer (Docker)
+
+```bash
+docker compose up --build -d
+```
+
+| Service | URL |
+|---------|-----|
+| RCA UI | http://localhost:8090 |
+| RCA API (direct) | http://localhost:3002/health |
+
+Sample reports: Android 15 fill-rate drop, iOS 18.1 cohort. Template spec: [docs/RCA_UI_TEMPLATE.md](docs/RCA_UI_TEMPLATE.md).
+
 **Sealed dataset:** change `AD_EVENTS_FILE` at the top of `scripts/replay.sh`,
 truncate manually (helper at the bottom of the script), then re-run. The script
 never truncates by itself.
