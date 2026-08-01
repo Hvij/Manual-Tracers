@@ -31,12 +31,17 @@ AD_EVENTS_FILE="InMobi/data/ad_events.parquet"
 #
 # 0 = load timestamps exactly as delivered (correct for offline analysis).
 # Set to the output of scripts/suggest_shift.sh for a live alerting demo.
-TIME_SHIFT_WEEKS=5
+# 6 puts the 2026-07-05 tail of the shipped file at ~2026-08-16 (2 weeks of
+# future headroom past today, 2026-08-02).
+TIME_SHIFT_WEEKS=6
 # =====================================================================
 
 DIM_DIR="InMobi/data"
 DB="inmobi"
 SQL_DIR="sql"
+# metric_sql.py uses `X | None` annotations (3.10+); the system python3 here is 3.9.
+# .venv is the same interpreter `uv run` gives RCA, so this stays in sync with it.
+PY=".venv/bin/python3"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
@@ -57,9 +62,15 @@ log() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mFATAL: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # Run one SQL statement. Body on stdin so quoting never bites us.
+#
+# Sessions run against `default`, NOT ${DB}: this script has to be able to
+# bootstrap a dropped database, and the connection check plus CREATE DATABASE
+# both run before ${DB} exists. Every statement in sql/ is fully qualified
+# (inmobi.x, and the dictionaries name DB 'inmobi' explicitly), so nothing
+# depends on the session database.
 ch() {
   local out
-  out=$(curl -sS --fail-with-body -u "$AUTH" "${URL}/?database=${DB}" \
+  out=$(curl -sS --fail-with-body -u "$AUTH" "${URL}/?database=default" \
           --data-binary @- 2>&1) || die "query failed: ${out}"
   printf '%s' "$out"
 }
@@ -184,7 +195,7 @@ FORMAT PrettyCompactMonoBlock"
 # rather than a parallel copy of the maths.
 for m in fill_rate requests ecpm revenue; do
   log "top segments for ${m} (live deviation scan)"
-  SCAN=$(python3 scripts/metric_query.py scan "$m") || die "could not render scan for ${m}"
+  SCAN=$("$PY" scripts/metric_query.py scan "$m") || die "could not render scan for ${m}"
   ch_sql "${SCAN} FORMAT PrettyCompactMonoBlock"
 done
 

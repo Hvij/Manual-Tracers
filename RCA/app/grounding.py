@@ -7,6 +7,26 @@ import re
 from app.utils import iter_leaves
 
 NUMBER_RE = re.compile(r"-?\d+\.\d+|-?\d+")
+ROUND_NDIGITS = 6  # matches the 0-6dp range allowed_numbers() already tolerates
+
+
+def round_floats(obj, ndigits: int = ROUND_NDIGITS):
+    """Round every float leaf in a nested ledger structure before it reaches the model.
+
+    ClickHouse floats carry 15-17 significant digits raw. The narrator's system prompt tells
+    the model to copy numbers verbatim rather than round — correct behavior once the number
+    it's copying is already clean, but a 17-digit echo of raw ClickHouse output reads as
+    fabricated (allowed_numbers only recognizes 0-6dp roundings). Rounding once, here, before
+    building the prompt AND before computing the allowed set keeps both sides looking at the
+    same figure, and produces prose someone would actually want to read.
+    """
+    if isinstance(obj, dict):
+        return {k: round_floats(v, ndigits) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [round_floats(v, ndigits) for v in obj]
+    if isinstance(obj, float):
+        return round(obj, ndigits)
+    return obj
 
 
 def fallback_summary(ledger: dict) -> str:

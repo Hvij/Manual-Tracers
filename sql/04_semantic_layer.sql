@@ -18,7 +18,7 @@
 -- ---------------------------------------------------------------------
 -- 4.1 metric_def: what each metric is, how it decomposes, how to test it
 -- ---------------------------------------------------------------------
-CREATE TABLE inmobi.metric_def
+CREATE TABLE IF NOT EXISTS inmobi.metric_def
 (
     metric_id       String,
     sql             String,  -- the metric, as an aggregate over ad_events_enriched
@@ -106,7 +106,7 @@ INSERT INTO inmobi.metric_def
 -- this design refuses to do. They remain reachable in ad_events_enriched
 -- for a manual drill, but the agent never enumerates them.
 -- ---------------------------------------------------------------------
-CREATE TABLE inmobi.metric_dim_map
+CREATE TABLE IF NOT EXISTS inmobi.metric_dim_map
 (
     metric_id    String,
     dim_id       String,  -- a column on ad_events_enriched
@@ -160,3 +160,34 @@ INSERT INTO inmobi.metric_dim_map (metric_id, dim_id, priority, rationale, depen
 ('ctr','device_model',3,'screen size effects',['os_version']),
 ('ctr','category',4,'audience intent varies by app type',['ad_format','publisher_tier']),
 ('ctr','country',5,'market-level engagement differences',['category','ad_format']);
+
+-- ---------------------------------------------------------------------
+-- 4.3 replay_clock: how fast wall-clock time is running.
+--
+-- One row. bucket_seconds = wall-clock seconds per data-hour. 3600 is real
+-- time and is the default; scripts/compress_replay.py rewrites this row when
+-- it loads a time-compressed replay, so 35 days of history can stream past a
+-- live HyperDX alert in minutes.
+--
+-- It lives in ClickHouse rather than in an env var because BOTH renderers
+-- (the agent and scripts/metric_query.py) must agree on it. If they disagree,
+-- the alert and the investigation bucket the same rows differently and the
+-- agent reports not_reproducible on an alert that just fired.
+--
+-- anchor     = unix seconds of data-bucket 0
+-- origin_dow = weekday of the first data day, 0 = Monday. Needed because a
+--              compressed calendar cannot be read off the timestamp: the
+--              baseline derives day-of-week from the bucket index instead.
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS inmobi.replay_clock
+(
+    id             UInt8 DEFAULT 1,
+    bucket_seconds UInt32,
+    anchor         Int64,
+    origin_dow     UInt8,
+    updated_at     DateTime DEFAULT now()
+)
+ENGINE = ReplacingMergeTree(updated_at)
+ORDER BY id;
+
+INSERT INTO inmobi.replay_clock (bucket_seconds, anchor, origin_dow) VALUES (3600, 0, 0);

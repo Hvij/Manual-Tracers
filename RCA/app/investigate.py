@@ -4,7 +4,7 @@ from statistics import mean
 
 from app import metric_sql
 from app.clickhouse_client import query_rows
-from app.registry import get_dim_deps, get_dim_map, get_metric, known_dims
+from app.registry import get_clock, get_dim_deps, get_dim_map, get_metric, known_dims
 from app.tracing import traced
 
 # guard against dividing by a near-zero total log-move when identity factors offset each
@@ -38,11 +38,21 @@ def _window_params(start, end) -> dict:
 
 def _deviation(meta: dict, dims: list[str]) -> str:
     return metric_sql.deviation_sql(meta, dims, hist_start="{hist_start:DateTime}",
-                                     start="{start:DateTime}", end="{end:DateTime}")
+                                     start="{start:DateTime}", end="{end:DateTime}",
+                                     clock=get_clock())
 
 
 def get_max_ts():
-    rows = query_rows("SELECT max(event_time) AS max_ts FROM inmobi.ad_events_enriched")
+    """least(now(), max(event_time)), NOT max(event_time).
+
+    The replay shifts event_time forward by whole weeks so ClickStack's wall-clock alert
+    evaluation has data to see, which leaves the newest rows in the future. Taking the raw
+    max would make the agent investigate a window days ahead of the one that alerted, on
+    hours that are only partially ingested. Clamping to now() keeps the alert and the
+    investigation looking at the same 24 hours."""
+    rows = query_rows(
+        "SELECT least(now(), toDateTime(max(event_time))) AS max_ts FROM inmobi.ad_events_enriched"
+    )
     return rows[0]["max_ts"]
 
 

@@ -1,4 +1,4 @@
-from app.grounding import allowed_numbers, check_grounding, fallback_summary
+from app.grounding import allowed_numbers, check_grounding, fallback_summary, round_floats
 
 # real numbers from the Android 15 / fill_rate incident (2026-07-30 window), same shape
 # run_investigation returns: decomposition=None for an L2 metric, one finding.
@@ -57,6 +57,24 @@ def test_fallback_summary_needs_no_llm_and_names_the_key_facts():
     assert "fill_rate" in summary
     assert "localized" in summary
     assert "Android 15" in summary
+
+
+def test_round_floats_makes_raw_clickhouse_precision_groundable():
+    # real shape: a ClickHouse float straight off the wire, 16 significant digits. The
+    # system prompt tells the model to copy numbers verbatim from what it's shown — before
+    # this fix, narrate.py handed it the raw ledger, so a fully-compliant model would write
+    # this exact 16-digit string, which no 0-6dp rounding of itself ever matches.
+    raw_value = 9.392279762013764
+    raw = {**LEDGER, "findings": [{**LEDGER["findings"][0],
+            "global": {**LEDGER["findings"][0]["global"], "peak_abs_z": raw_value}}]}
+    verbatim_echo = str(raw_value)
+    assert verbatim_echo not in allowed_numbers(raw)  # the bug: a compliant echo was rejected
+
+    # the fix: round before the model ever sees it, so a verbatim copy is always groundable
+    rounded = round_floats(raw)
+    assert rounded["findings"][0]["global"]["peak_abs_z"] == 9.39228
+    compliant_narrative = "peak z-score reached 9.39228 during the window."
+    assert check_grounding(compliant_narrative, allowed_numbers(rounded)) == []
 
 
 def test_fallback_summary_names_both_halves_of_a_crossed_culprit():

@@ -17,6 +17,7 @@ elegant, but never trade away correctness or traceability, which are what is sco
 | `architecture.md` | System design and the reasoning behind it |
 | `docs/RCA_AGENT_DESIGN.md` | **As-built.** What actually runs today (`RCA/app/`), vs. what's still to build |
 | `docs/RCA_DECOMPOSITION_MATH.md` | Derivation of the log-share revenue decomposition |
+| `docs/REPLAY_CLOCK.md` | How the time shift and `replay_clock` bucket math work, and how compressed replay will plug in |
 
 ## Hard constraints
 

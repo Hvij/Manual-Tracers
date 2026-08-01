@@ -1,122 +1,124 @@
+#!/usr/bin/env python3
+"""Compress the currently-loaded replay so 35 days of history streams past a live
+HyperDX alert in minutes instead of real-time weeks.
+
+Rewrites every row's event_time so 1 data-hour occupies BUCKET_SECONDS of wall-clock
+time instead of 3600, anchored at "now" — the compressed window starts in the near
+future and streams forward, so the alert sees each hour become live at its own pace,
+same mechanism as real time, just faster. Updates inmobi.replay_clock so both the
+alert query (scripts/metric_query.py) and the RCA agent (RCA/app/registry.get_clock)
+bucket the compressed rows identically — see docs/REPLAY_CLOCK.md.
+
+Operates entirely server-side on whatever is already in inmobi.ad_events (run
+scripts/replay.sh first) — no local file re-read, no hardcoded dataset dates:
+data_start and origin_dow are discovered from min(event_time) at run time, exactly
+like the rest of this system reads its own registry rather than restating it.
+
+    ./scripts/compress_replay.py                    # 1 data-hour per wall-clock second
+    ./scripts/compress_replay.py --bucket-seconds 3  # slower, e.g. for a longer demo
+
+Depends on nothing outside the standard library, same as metric_query.py.
 """
-Replay historical Parquet data into ClickHouse, time-compressed so that
-HyperDX's real (scheduled) alert evaluation sees it and can fire real
-webhooks -- instead of waiting out the actual N-day span in real time.
+from __future__ import annotations
 
-MECHANISM
----------
-HyperDX alerts run on a fixed interval (e.g. 1 minute) and each tick checks
-`Timestamp BETWEEN now() - interval AND now()` against your table. To
-replay many days quickly and still get *real* evaluations + webhook fires:
+import argparse
+import base64
+import json
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
 
-  1. Split the data into chunks (default: one per original calendar day).
-  2. TRUNCATE the scratch table before each chunk, so only that chunk's
-     data is ever visible -- this keeps chunks isolated even if your test
-     alert's query has no time filter of its own.
-  3. Rescale that chunk's timestamps -- preserving relative order and
-     spacing -- into a short "landing zone" inside the next upcoming
-     evaluation window, then insert.
-  4. Sleep until that window has closed, then repeat for the next chunk.
-
-Row *count* and relative shape within each chunk are preserved, so
-count / threshold / percentile-based alert logic evaluates the same way
-it would have against the original, uncompressed data.
-
-SETUP (once)
-------------
-1. In ClickHouse:
-     CREATE TABLE my_table_replay_test AS my_table;
-
-2. In HyperDX: clone the real alert you want to test.
-     - point it at the scratch table above, not production
-     - set interval to the shortest available (1m)
-     - point the webhook at a disposable test endpoint (e.g.
-       https://webhook.site) instead of your real Slack/PagerDuty channel
-     - keep (or add) a time filter in the query ($__timeFilter(...) or the
-       startDateMilliseconds/endDateMilliseconds macros) -- the TRUNCATE
-       step protects you even without one, but keeping it gives cleaner
-       per-chunk attribution if you ever skip the truncate
-
-3. pip install clickhouse-connect pandas pyarrow
-"""
-
-import time
-from datetime import datetime, timedelta, timezone
-
-import pandas as pd
-import clickhouse_connect
-
-# ---------------------------------------------------------------- CONFIG
-
-PARQUET_PATH = "data.parquet"
-TIMESTAMP_COL = "timestamp"              # your event-time column
-
-CH_HOST = "localhost"
-CH_PORT = 8123
-CH_USER = "default"
-CH_PASSWORD = ""
-CH_DATABASE = "default"
-TARGET_TABLE = "my_table_replay_test"    # scratch table -- NOT production
-
-CHUNK_FREQ = "D"          # "D" = one chunk per calendar day (~30 chunks for
-                           # 30 days -> ~30 min total at 60s/chunk below).
-                           # "h" = one chunk per hour catches intra-day
-                           # spikes too, but ~720 chunks -> ~12 hours.
-
-TEST_ALERT_INTERVAL_SECONDS = 60   # must match the cloned test alert's interval
-SAFETY_BUFFER_SECONDS = 5          # margin left at each window's edges
-
-# -------------------------------------------------------------------------
+ROOT = Path(__file__).resolve().parents[1]
 
 
-def main():
-    df = pd.read_parquet(PARQUET_PATH)
-    df[TIMESTAMP_COL] = pd.to_datetime(df[TIMESTAMP_COL])
-    df = df.sort_values(TIMESTAMP_COL).reset_index(drop=True)
+def load_env() -> dict:
+    env = {}
+    for line in (ROOT / ".env").read_text().splitlines():
+        line = line.strip()
+        if line and not line.startswith("#") and "=" in line:
+            k, v = line.split("=", 1)
+            env[k.strip()] = v.strip().strip('"').strip("'")
+    return env
 
-    df["_chunk_key"] = df[TIMESTAMP_COL].dt.floor(CHUNK_FREQ)
-    chunks = [g.drop(columns="_chunk_key") for _, g in df.groupby("_chunk_key")]
 
-    est_minutes = len(chunks) * TEST_ALERT_INTERVAL_SECONDS / 60
-    print(f"{len(chunks)} chunks ({CHUNK_FREQ}), spanning "
-          f"{df[TIMESTAMP_COL].min()} -> {df[TIMESTAMP_COL].max()}")
-    print(f"Estimated wall-clock runtime: ~{est_minutes:.0f} minutes "
-          f"({TEST_ALERT_INTERVAL_SECONDS}s per chunk)")
-    input("Press Enter to start, or Ctrl+C to abort... ")
+def _request(env: dict, sql: str) -> bytes:
+    url = f"https://{env['CLICKHOUSE_HOST']}:{env.get('CLICKHOUSE_HTTPS_PORT', '8443')}/?database=inmobi"
+    req = urllib.request.Request(url, data=sql.encode())
+    auth = f"{env['CLICKHOUSE_USER']}:{env['CLICKHOUSE_PASSWORD']}"
+    req.add_header("Authorization", "Basic " + base64.b64encode(auth.encode()).decode())
+    return urllib.request.urlopen(req, timeout=300).read()
 
-    client = clickhouse_connect.get_client(
-        host=CH_HOST, port=CH_PORT, username=CH_USER,
-        password=CH_PASSWORD, database=CH_DATABASE,
-    )
 
-    landing_zone = TEST_ALERT_INTERVAL_SECONDS - 2 * SAFETY_BUFFER_SECONDS
-    if landing_zone <= 0:
-        raise ValueError("SAFETY_BUFFER_SECONDS too large for this interval")
+def execute(env: dict, sql: str) -> None:
+    _request(env, sql)
 
-    for i, chunk in enumerate(chunks, start=1):
-        client.command(f"TRUNCATE TABLE {TARGET_TABLE}")
 
-        chunk = chunk.copy()
-        orig_start = chunk[TIMESTAMP_COL].min()
-        orig_span = (chunk[TIMESTAMP_COL].max() - orig_start).total_seconds() or 1.0
-        ratio = landing_zone / orig_span
+def query(env: dict, sql: str) -> list:
+    body = _request(env, sql).decode()
+    return [json.loads(line) for line in body.splitlines() if line.strip()]
 
-        # naive UTC "now" -- keeps this consistent with typical tz-naive
-        # Parquet/ClickHouse DateTime columns. If your timestamps are
-        # tz-aware, drop the .replace(tzinfo=None) below.
-        target_start = (datetime.now(timezone.utc).replace(tzinfo=None)
-                         + timedelta(seconds=SAFETY_BUFFER_SECONDS))
-        chunk[TIMESTAMP_COL] = target_start + (chunk[TIMESTAMP_COL] - orig_start) * ratio
 
-        client.insert_df(TARGET_TABLE, chunk)
-        print(f"[{i:>3}/{len(chunks)}] {len(chunk):>6} rows | "
-              f"orig {orig_start.date()} -> landing ~{target_start.time()}")
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--bucket-seconds", type=int, default=1,
+                     help="wall-clock seconds per data-hour (default: 1 -> ~14 min for 840h)")
+    args = ap.parse_args()
+    bucket_seconds = args.bucket_seconds
 
-        time.sleep(TEST_ALERT_INTERVAL_SECONDS)
+    env = load_env()
 
-    print("Replay complete. Check the alert's evaluation history in HyperDX "
-          "and your test webhook endpoint.")
+    anchor = int(query(env, "SELECT toUnixTimestamp(now()) AS t FORMAT JSONEachRow")[0]["t"])
+
+    bounds = query(
+        env,
+        "SELECT toUnixTimestamp(min(event_time)) AS start, "
+        "toDayOfWeek(min(event_time)) AS iso_dow, "
+        "dateDiff('hour', min(event_time), max(event_time)) + 1 AS hours "
+        "FROM inmobi.ad_events FORMAT JSONEachRow",
+    )[0]
+    data_start = int(bounds["start"])
+    origin_dow = int(bounds["iso_dow"]) - 1  # ClickHouse: 1=Mon..7=Sun -> 0=Mon..6=Sun
+    total_hours = int(bounds["hours"])
+    window_seconds = total_hours * bucket_seconds
+
+    print(f"compressing {total_hours} data-hours into {window_seconds}s "
+          f"({window_seconds / 60:.1f} min) of wall-clock time, starting now "
+          f"({datetime.fromtimestamp(anchor, tz=timezone.utc).isoformat()})")
+
+    print("staging a copy of ad_events ...")
+    execute(env, "DROP TABLE IF EXISTS inmobi.ad_events_staging")
+    execute(env, "CREATE TABLE inmobi.ad_events_staging ENGINE = MergeTree ORDER BY event_time "
+                 "AS SELECT * FROM inmobi.ad_events")
+
+    print("truncating ad_events + ad_events_enriched ...")
+    execute(env, "TRUNCATE TABLE inmobi.ad_events")
+    execute(env, "TRUNCATE TABLE inmobi.ad_events_enriched")
+
+    print("re-inserting with compressed event_time (MV1 repopulates ad_events_enriched) ...")
+    execute(env, f"""
+INSERT INTO inmobi.ad_events
+SELECT
+    toDateTime64({anchor} + intDiv(toUnixTimestamp(event_time) - {data_start}, 3600)
+                 * {bucket_seconds}, 3) AS event_time,
+    app_id, geo_device_id, advertiser_id, ad_format,
+    is_filled, is_impression, is_click, revenue
+FROM inmobi.ad_events_staging
+""")
+
+    print("dropping staging table ...")
+    execute(env, "DROP TABLE inmobi.ad_events_staging")
+
+    print("updating inmobi.replay_clock ...")
+    execute(env, "INSERT INTO inmobi.replay_clock (bucket_seconds, anchor, origin_dow) "
+                 f"VALUES ({bucket_seconds}, {anchor}, {origin_dow})")
+
+    rows = query(env, "SELECT count() AS n, toString(min(event_time)) AS lo, "
+                       "toString(max(event_time)) AS hi FROM inmobi.ad_events_enriched "
+                       "FORMAT JSONEachRow")[0]
+    print(f"done. ad_events_enriched: {rows['n']} rows, event_time {rows['lo']} .. {rows['hi']}")
+    print(f"replay_clock: bucket_seconds={bucket_seconds} anchor={anchor} origin_dow={origin_dow}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

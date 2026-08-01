@@ -40,3 +40,12 @@ def known_dims() -> frozenset[str]:
         "SELECT DISTINCT dim_id FROM inmobi.metric_dim_map FINAL WHERE dim_id != 'ALL'"
     )
     return frozenset(r["dim_id"] for r in rows)
+
+
+def get_clock() -> dict:
+    """How fast wall-clock time is running relative to data time. Real time unless a
+    compressed replay rewrote the row — see sql/04_semantic_layer.sql §4.3."""
+    rows = query_rows(
+        "SELECT bucket_seconds, anchor, origin_dow FROM inmobi.replay_clock FINAL LIMIT 1"
+    )
+    return rows[0] if rows else {"bucket_seconds": 3600, "anchor": 0, "origin_dow": 0}

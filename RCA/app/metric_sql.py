@@ -17,6 +17,46 @@ HISTORY_WEEKS = 10       # enough for 20 same-hour, same-day-type points on week
 BASELINE_POINTS = 20
 MIN_BASE_POINTS = 8      # below this the baseline is not worth scoring against
 
+# A "bucket" is one data-hour. In real time that is 3600 wall-clock seconds; in a
+# compressed replay (scripts/compress_replay.py) it is fewer, so 35 days of history can
+# stream past a live alert in minutes. Everything below is written in buckets, never in
+# hours, so the two cases share one code path.
+REAL_BUCKET_SECONDS = 3600
+
+
+def _clock_exprs(clock: dict | None) -> tuple[str, str, str]:
+    """(bucket expression, hour-of-day, is-weekend) for the configured clock.
+
+    Real time: plain calendar functions on the event timestamp.
+
+    Compressed: the calendar is a lie — a whole data-day may occupy 24 wall-clock seconds,
+    so toHour()/toDayOfWeek() describe the replay, not the data. Seasonality has to come
+    from the bucket INDEX instead: index % 24 is the data hour-of-day, and index / 24
+    offset by the weekday the data actually starts on is the data day-of-week. Without
+    this the baseline stops being seasonal and every night-time hour reads as an anomaly.
+    """
+    if not clock or int(clock["bucket_seconds"]) == REAL_BUCKET_SECONDS:
+        return "toStartOfHour(event_time)", "toHour(ts)", "toDayOfWeek(ts) >= 6"
+
+    size, anchor, origin_dow = (int(clock["bucket_seconds"]), int(clock["anchor"]),
+                                 int(clock["origin_dow"]))
+    idx = f"intDiv(toUnixTimestamp(ts) - {anchor}, {size})"
+    return (
+        f"toDateTime(intDiv(toUnixTimestamp(event_time) - {anchor}, {size}) * {size} + {anchor})",
+        f"({idx}) % 24",
+        f"(intDiv({idx}, 24) + {origin_dow}) % 7 >= 5",
+    )
+
+
+def bucket_seconds(clock: dict | None) -> int:
+    return int(clock["bucket_seconds"]) if clock else REAL_BUCKET_SECONDS
+
+
+def window_seconds(buckets: int, clock: dict | None) -> int:
+    """Convert a span expressed in data-hours into wall-clock seconds under this clock.
+    A 24-data-hour lookback is 24h of real time, but only 24s at 1 bucket/second."""
+    return buckets * bucket_seconds(clock)
+
 
 def dim_tuples(dims: list[str]) -> str:
     """ARRAY JOIN fan-out: one output row per (bucket, dimension). 'ALL' is the global
@@ -38,7 +78,8 @@ def _expected_and_z(meta: dict) -> tuple[str, str]:
     return "base_median", "if(expected IS NULL, NULL, (actual - expected) / robust_sigma)"
 
 
-def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end: str) -> str:
+def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end: str,
+                   clock: dict | None = None) -> str:
     """Hourly series for `dims`, scored against its own seasonal baseline.
 
     `hist_start` / `start` / `end` are SQL fragments, not values: the agent passes bound
@@ -46,6 +87,7 @@ def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end:
     between hist_start and start exist only to build the baseline; only rows after `start`
     are returned.
     """
+    bucket_expr, hour_expr, weekend_expr = _clock_exprs(clock)
     expected_expr, z_expr = _expected_and_z(meta)
     den_expr = meta["denominator"] or "0"
     # an absolute floor of 0 means "no floor" — emit no clause rather than `0 = 0`
@@ -54,7 +96,7 @@ def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end:
 
     return f"""
 WITH points AS (
-    SELECT toStartOfHour(event_time) AS ts,
+    SELECT {bucket_expr} AS ts,
            d.1 AS dim_name,
            d.2 AS dim_value,
            {meta['sql']} AS actual,
@@ -79,7 +121,7 @@ windowed AS (
            count()                     OVER w AS base_points
     FROM points
     WINDOW w AS (
-        PARTITION BY dim_name, dim_value, toHour(ts), toDayOfWeek(ts) >= 6
+        PARTITION BY dim_name, dim_value, {hour_expr}, {weekend_expr}
         ORDER BY ts
         ROWS BETWEEN {BASELINE_POINTS} PRECEDING AND 1 PRECEDING
     )

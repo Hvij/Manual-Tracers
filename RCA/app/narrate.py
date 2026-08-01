@@ -4,7 +4,7 @@ import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from app.grounding import allowed_numbers, check_grounding, fallback_summary
+from app.grounding import allowed_numbers, check_grounding, fallback_summary, round_floats
 from app.settings import get_settings
 from app.tracing import traced
 from app.utils import content_to_text
@@ -58,14 +58,15 @@ def narrate(ledger: dict) -> dict:
         logger.warning("GEMINI_API_KEY not set — falling back to templated summary")
         return {"narrative": fallback_summary(ledger), "grounded": True, "source": "template"}
 
-    allowed = allowed_numbers(ledger)
+    rounded = round_floats(ledger)
+    allowed = allowed_numbers(rounded)
     llm = ChatGoogleGenerativeAI(
         model=settings.gemini_model,
         google_api_key=settings.gemini_api_key,
         temperature=0,  # copy numbers verbatim, never embellish
     )
     response = llm.invoke(
-        [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=json.dumps(ledger, default=str))]
+        [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=json.dumps(rounded, default=str))]
     )
     text = content_to_text(response.content)
 
