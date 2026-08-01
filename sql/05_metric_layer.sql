@@ -44,7 +44,7 @@ INSERT INTO inmobi.metric_registry
 --
 -- L1 — the outcome we actually care about
 ('revenue',     1, 0, 'revenue',     '',            1.0,    'both', 'robust_z',   2000, 0.03, 0.0,
- [], 'sum(revenue). The business outcome; decomposed via the revenue identity.'),
+ [], 'sum(revenue). The business outcome — decomposed via the revenue identity.'),
 -- L2 — the identity factors: Revenue = Requests x FillRate x RenderRate x eCPM/1000
 ('requests',    2, 0, 'requests',    '',            1.0,    'both', 'robust_z',   2000, 0.05, 0.0,
  ['vertical','campaign_type'], 'count(*). Volume factor.'),

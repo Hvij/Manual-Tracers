@@ -15,7 +15,8 @@ elegant, but never trade away correctness or traceability, which are what is sco
 | `InMobi/PROBLEM_STATEMENT.md` | The brief and the five judging criteria |
 | `InMobi/metrics_glossary.md` | **Authoritative** metric formulas — never restate them elsewhere |
 | `architecture.md` | System design and the reasoning behind it |
-| `docs/RCA_OUTPUT_CONTRACT.md` | The ledger, the narrative, the trace, the webhook payload |
+| `docs/RCA_AGENT_DESIGN.md` | **As-built.** What actually runs today (`RCA/app/`), vs. what's still to build |
+| `docs/RCA_OUTPUT_CONTRACT.md` | The ledger, the narrative, the trace, the webhook payload (target shape; §4 matches reality) |
 | `docs/WORK_HARSH_DATA.md` | Harsh's queue |
 | `docs/WORK_ML_AGENT.md` | Partner's queue |
 
@@ -41,12 +42,22 @@ ad_events                bronze · raw, replayed, the only table reloaded
   └─ MV2 ─▶ metric_1h            gold   · hourly marginals · ALERT surface (~53K rows)
                  ├─ v_metric_points     THE metric layer — formulas live only here
                  ├─ v_metric_baseline   seasonal baseline
-                 ├─ v_metric_deviation  scored + guard-railed
-                 └─ v_incidents ─▶ anomaly_events ─▶ webhook ─▶ RCA agent
+                 └─ v_metric_deviation  scored + guard-railed
+                        │  ClickStack tile alert (is_anomaly count, metric_id in message)
+                        ▼
+                   webhook ─▶ RCA agent (RCA/app/) ─▶ [narrator + trace, not yet built]
 ```
 
 Files: `sql/01_schema` → `02_dictionaries` → `03_silver` → `04_gold` →
 `05_metric_layer` → `06_detection`. Apply in order; `scripts/replay.sh` does it.
+`06_detection.sql` ends at `v_metric_deviation` — there is no persisted
+incident table; the RCA agent re-derives everything live per alert (see
+`docs/RCA_AGENT_DESIGN.md` §3.3 for what was removed and why).
+
+The RCA agent itself (webhook receiver + investigation ladder) is its own `uv`
+project in `RCA/` — `RCA/app/main.py` (webhook), `RCA/app/investigate.py`
+(reproduce → decompose → scan → holdout), `RCA/app/registry.py`
+(`metric_registry` / `metric_dim_priority` lookups).
 
 ## Non-negotiable design rules
 
@@ -84,6 +95,17 @@ Files: `sql/01_schema` → `02_dictionaries` → `03_silver` → `04_gold` →
 - **The sandbox cannot reach ClickHouse Cloud** (proxy 403). Validate SQL by running
   it as a SELECT through the ClickStack MCP; execute DDL locally.
 - Pushing needs Harsh's SSH key — the sandbox has none.
+- **`curl --data-binary @path` can fail to open large files in some sandboxed
+  shells** (`curl: option --data-binary: error encountered when reading a file`,
+  even though the file exists and is readable). `replay.sh` streams both the
+  dimension CSVs and `AD_EVENTS_FILE` via stdin redirection (`--data-binary @- <
+  "$file"`) instead — functionally identical, just avoids curl's own file-open
+  path. Don't revert this to `@"$file"` on the sealed-dataset run.
+- **ClickStack alert message templates only support `{{title}}`/`{{body}}`/
+  `{{link}}`** — no group-by value, row column, or window timestamp (checked
+  against the ClickStack alerts docs). A per-metric `metric_id=<x>` has to be a
+  static string baked into each alert at config time, one alert per metric —
+  it cannot be templated from the firing row.
 
 ## Data facts worth knowing
 

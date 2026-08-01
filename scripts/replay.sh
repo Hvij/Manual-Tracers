@@ -31,7 +31,7 @@ AD_EVENTS_FILE="InMobi/data/ad_events.parquet"
 #
 # 0 = load timestamps exactly as delivered (correct for offline analysis).
 # Set to the output of scripts/suggest_shift.sh for a live alerting demo.
-TIME_SHIFT_WEEKS=0
+TIME_SHIFT_WEEKS=5
 # =====================================================================
 
 DIM_DIR="InMobi/data"
@@ -74,7 +74,7 @@ ch_load() {
   local out
   out=$(curl -sS --fail-with-body -u "$AUTH" \
           "${URL}/?query=${enc}${extra}" \
-          --data-binary @"$file" 2>&1) || die "load into $table failed: ${out}"
+          --data-binary @- < "$file" 2>&1) || die "load into $table failed: ${out}"
 }
 
 # Split a .sql file on ';' at end-of-statement and execute sequentially.
@@ -157,7 +157,7 @@ if (( DO_DATA )); then
        FROM input('${SCHEMA}') FORMAT Parquet"
     ENC=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$Q")
     OUT=$(curl -sS --fail-with-body -u "$AUTH" "${URL}/?query=${ENC}" \
-            --data-binary @"$AD_EVENTS_FILE" 2>&1) || die "shifted load failed: ${OUT}"
+            --data-binary @- < "$AD_EVENTS_FILE" 2>&1) || die "shifted load failed: ${OUT}"
   fi
   echo "   done in $(( $(date +%s) - START ))s"
 fi
@@ -182,10 +182,16 @@ FORMAT PrettyCompactMonoBlock"
 
 log "top incidents detected"
 ch_sql "
-SELECT day, metric_id, dim_name, dim_value, direction, anomalous_hours,
-       round(avg_actual,4) AS actual, round(avg_expected,4) AS expected,
-       round(avg_delta_rel*100,2) AS delta_pct, peak_abs_z, severity
-FROM ${DB}.v_incidents
+SELECT toDate(ts) AS day, metric_id, dim_name, dim_value, direction,
+       countIf(is_anomaly) AS anomalous_hours,
+       round(avgIf(actual, is_anomaly),4) AS actual,
+       round(avgIf(expected, is_anomaly),4) AS expected,
+       round(avgIf(delta_rel, is_anomaly)*100,2) AS delta_pct,
+       round(maxIf(abs(z_score), is_anomaly),2) AS peak_abs_z,
+       max(severity) AS severity
+FROM ${DB}.v_metric_deviation
+GROUP BY day, metric_id, dim_name, dim_value, direction
+HAVING anomalous_hours >= 3
 ORDER BY peak_abs_z DESC
 LIMIT 25
 FORMAT PrettyCompactMonoBlock"

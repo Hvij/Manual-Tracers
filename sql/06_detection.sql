@@ -52,105 +52,81 @@ WINDOW w AS (
 -- ---------------------------------------------------------------------
 -- 6.2 Deviation: score every point against its baseline + registry rules
 -- ---------------------------------------------------------------------
+-- Nested subqueries, not a flat WITH-alias chain: ClickHouse's analyzer does
+-- not reliably accept a WITH alias (`expected`) being referenced by a later
+-- WITH alias in the same list on CREATE OR REPLACE — each nesting level below
+-- turns the previous level's aliases into plain columns, which is unambiguous.
 CREATE OR REPLACE VIEW inmobi.v_metric_deviation AS
-WITH
-    -- expected value under the baseline
-    if(r.detector = 'proportion',
-       if(b.base_den = 0, NULL, b.base_num / b.base_den * 1.0),
-       b.base_median)                                   AS expected,
-    -- robust spread -> normal-equivalent sigma
-    greatest((b.base_q75 - b.base_q25) / 1.349, 1e-9)   AS robust_sigma,
-    b.value - expected                                  AS delta_abs,
-    if(expected IS NULL OR expected = 0, NULL,
-       (b.value - expected) / expected)                 AS delta_rel,
-    -- test statistic, per detector
-    if(r.detector = 'proportion'
-         AND b.denominator > 0 AND b.base_den > 0,
-       proportionsZTest(toUInt64(b.numerator), toUInt64(b.base_num),
-                        toUInt64(b.denominator), toUInt64(b.base_den),
-                        0.999, 'unpooled').1,
-       if(expected IS NULL, NULL, (b.value - expected) / robust_sigma)
-    )                                                   AS z_score
 SELECT
-    b.ts                AS ts,
-    b.dim_name          AS dim_name,
-    b.dim_value         AS dim_value,
-    b.metric_id         AS metric_id,
-    r.level             AS metric_level,
-    r.detector          AS detector,
-    b.value             AS actual,
-    expected            AS expected,
-    delta_abs           AS delta_abs,
-    delta_rel           AS delta_rel,
-    z_score             AS z_score,
-    b.sample_count      AS sample_count,
-    b.base_points       AS base_points,
-    -- ---- guard rails: all must pass before anything is called an anomaly
-    (b.sample_count >= r.min_samples)                       AS pass_sample,
-    (b.base_points  >= 8)                                   AS pass_history,
-    (abs(delta_rel) >= r.min_effect_rel)                    AS pass_effect_rel,
-    (r.min_effect_abs = 0 OR abs(delta_abs) >= r.min_effect_abs) AS pass_effect_abs,
-    (abs(z_score)   >= 4.0)                                 AS pass_significance,
-    (NOT has(r.invalid_dims, b.dim_name))                   AS pass_valid_dim,
+    *,
     (pass_sample AND pass_history AND pass_effect_rel
        AND pass_effect_abs AND pass_significance AND pass_valid_dim) AS is_anomaly,
     if(delta_abs < 0, 'drop', 'spike')                      AS direction,
     multiIf(abs(z_score) >= 12, 'critical',
             abs(z_score) >= 8,  'major',
                                 'minor')                    AS severity
-FROM inmobi.v_metric_baseline AS b
-INNER JOIN inmobi.metric_registry AS r ON r.metric_id = b.metric_id;
+FROM (
+    SELECT
+        ts, dim_name, dim_value, metric_id, metric_level, detector,
+        actual, expected, delta_abs, delta_rel, z_score,
+        sample_count, base_points,
+        (sample_count >= min_samples)                           AS pass_sample,
+        (base_points  >= 8)                                     AS pass_history,
+        (abs(delta_rel) >= min_effect_rel)                      AS pass_effect_rel,
+        (min_effect_abs = 0 OR abs(delta_abs) >= min_effect_abs) AS pass_effect_abs,
+        (abs(z_score)   >= 4.0)                                 AS pass_significance,
+        (NOT has(invalid_dims, dim_name))                       AS pass_valid_dim
+    FROM (
+        SELECT
+            ts, dim_name, dim_value, metric_id, metric_level, detector,
+            actual, expected,
+            actual - expected AS delta_abs,
+            if(expected IS NULL OR expected = 0, NULL,
+               (actual - expected) / expected)               AS delta_rel,
+            if(detector = 'proportion' AND denominator > 0 AND base_den > 0,
+               proportionsZTest(toUInt64(numerator), toUInt64(base_num),
+                                toUInt64(denominator), toUInt64(base_den),
+                                0.999, 'unpooled').1,
+               if(expected IS NULL, NULL, (actual - expected) / robust_sigma)
+            )                                                  AS z_score,
+            sample_count, base_points, min_samples, min_effect_rel,
+            min_effect_abs, invalid_dims
+        FROM (
+            SELECT
+                b.ts                AS ts,
+                b.dim_name          AS dim_name,
+                b.dim_value         AS dim_value,
+                b.metric_id         AS metric_id,
+                r.level             AS metric_level,
+                r.detector          AS detector,
+                b.value             AS actual,
+                b.numerator         AS numerator,
+                b.denominator       AS denominator,
+                b.base_num          AS base_num,
+                b.base_den          AS base_den,
+                b.sample_count      AS sample_count,
+                b.base_points       AS base_points,
+                r.min_samples       AS min_samples,
+                r.min_effect_rel    AS min_effect_rel,
+                r.min_effect_abs    AS min_effect_abs,
+                r.invalid_dims      AS invalid_dims,
+                if(r.detector = 'proportion',
+                   if(b.base_den = 0, NULL, b.base_num / b.base_den * 1.0),
+                   b.base_median)                             AS expected,
+                greatest((b.base_q75 - b.base_q25) / 1.349, 1e-9) AS robust_sigma
+            FROM inmobi.v_metric_baseline AS b
+            INNER JOIN inmobi.metric_registry AS r ON r.metric_id = b.metric_id
+        )
+    )
+);
 
 -- ---------------------------------------------------------------------
--- 6.3 Incident roll-up: an incident is a metric+segment that stays
--- anomalous for several hours on a day. Single-hour blips do not page.
--- This is the table the alert fires on and the RCA agent consumes.
+-- 6.3 v_incidents / anomaly_events / mv_anomaly_feed / v_alert_feed /
+-- v_rca_queue — REMOVED. That whole day-level incident-ledger path is
+-- superseded: the RCA agent now triggers off ClickStack alerts on
+-- v_metric_deviation directly (metric_id carried in the alert body) and
+-- queries metric_registry / metric_dim_priority / v_metric_deviation live
+-- per investigation — see RCA/app/investigate.py. Keeping this view here
+-- would just silently recreate a second, unused incident-tracking path on
+-- every replay.
 -- ---------------------------------------------------------------------
-CREATE OR REPLACE VIEW inmobi.v_incidents AS
-SELECT
-    toDate(ts)                        AS day,
-    metric_id,
-    metric_level,
-    dim_name,
-    dim_value,
-    direction,
-    countIf(is_anomaly)               AS anomalous_hours,
-    count()                           AS observed_hours,
-    round(avgIf(actual,   is_anomaly), 6) AS avg_actual,
-    round(avgIf(expected, is_anomaly), 6) AS avg_expected,
-    round(avgIf(delta_rel, is_anomaly), 6) AS avg_delta_rel,
-    round(maxIf(abs(z_score), is_anomaly), 2) AS peak_abs_z,
-    sum(sample_count)                 AS day_requests,
-    max(severity)                     AS severity
-FROM inmobi.v_metric_deviation
-GROUP BY day, metric_id, metric_level, dim_name, dim_value, direction
-HAVING anomalous_hours >= 3          -- persistence requirement
-ORDER BY peak_abs_z DESC;
-
--- ---------------------------------------------------------------------
--- 6.4 Persisted incident state. The RCA agent writes back here, so a
--- judge can trace alert -> investigation -> diagnosis in one table.
--- ---------------------------------------------------------------------
-CREATE TABLE IF NOT EXISTS inmobi.anomaly_events
-(
-    anomaly_id      UUID DEFAULT generateUUIDv4(),
-    fingerprint     String,   -- day|metric|dim_name|dim_value|direction
-    day             Date,
-    metric_id       String,
-    dim_name        String,
-    dim_value       String,
-    direction       String,
-    severity        String,
-    anomalous_hours UInt16,
-    actual          Float64,
-    expected        Float64,
-    delta_rel       Float64,
-    peak_abs_z      Float64,
-    rca_status      String DEFAULT 'pending',   -- pending|running|done|failed
-    rca_summary     String DEFAULT '',
-    trace_url       String DEFAULT '',
-    detected_at     DateTime DEFAULT now(),
-    updated_at      DateTime DEFAULT now()
-)
-ENGINE = ReplacingMergeTree(updated_at)
-ORDER BY fingerprint;

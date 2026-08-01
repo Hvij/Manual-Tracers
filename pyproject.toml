@@ -1,0 +1,25 @@
+[project]
+name = "manual-tracers"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.13"
+dependencies = [
+    "clickhouse-connect>=1.6.0",
+    "fastapi>=0.139.2",
+    "python-dotenv>=1.2.2",
+    "uvicorn[standard]>=0.51.0",
+]
+
+[dependency-groups]
+dev = [
+    "httpx>=0.28.1",
+    "pytest>=9.1.1",
+]
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+default = true
+
+[tool.pytest.ini_options]
+testpaths = ["RCA/tests"]

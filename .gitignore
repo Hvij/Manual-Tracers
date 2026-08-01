@@ -5,3 +5,4 @@ hyperdx_mongo_data/
 
 # local runtime
 __wtest
+.idea/

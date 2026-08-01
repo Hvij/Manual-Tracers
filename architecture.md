@@ -10,14 +10,23 @@ ad_events (bronze, replayed)
                   │
                   ├─ v_metric_points     metric layer (formulas live ONLY here)
                   ├─ v_metric_baseline   seasonal baseline
-                  ├─ v_metric_deviation  scored, guard-railed
-                  └─ v_incidents ─▶ anomaly_events ─▶ webhook ─▶ RCA agent
-                                                                   │
-                                            drills ad_events_enriched (depth 2)
-                                                                   ▼
-                                                    hypothesis ledger ─▶ LLM narrator
-                                                                     └─▶ Langfuse trace
+                  └─ v_metric_deviation  scored, guard-railed
+                          │
+                    ClickStack tile alert (is_anomaly count, metric_id in message)
+                          │  webhook
+                          ▼
+                    RCA agent (RCA/app/) — reproduce → decompose → scan → holdout
+                          │  drills ad_events_enriched
+                          ▼
+                    hypothesis ledger ─▶ [not yet built] LLM narrator
+                                      └─▶ [not yet built] Langfuse trace
 ```
+
+There is no persisted incident table between detection and the agent — the
+agent re-derives everything live from `v_metric_deviation` and
+`ad_events_enriched` on each alert. An earlier `v_incidents`/`anomaly_events`
+day-level ledger was removed as a duplicate source of truth; see
+`docs/RCA_AGENT_DESIGN.md` §3.3.
 
 ## The rule that makes this scale
 
@@ -38,7 +47,6 @@ are drill-down targets during RCA, never alert series. This is what holds at 100
 |---|---|
 | `metric_registry` | metric_id, level, numerator/denominator, detector, guard rails, invalid_dims |
 | `metric_dim_priority` | per-metric drill order with a written rationale |
-| `anomaly_events` | fired incidents + RCA status + trace URL (audit and dedup) |
 
 Metrics follow `InMobi/metrics_glossary.md` exactly, and are **levelled**:
 

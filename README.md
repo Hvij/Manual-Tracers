@@ -5,6 +5,7 @@ responsible segment, and produces an evidence-backed diagnosis where every numbe
 is computed — not narrated into existence.
 
 - **Architecture:** [architecture.md](architecture.md)
+- **As-built RCA agent design:** [docs/RCA_AGENT_DESIGN.md](docs/RCA_AGENT_DESIGN.md)
 - **RCA output contract:** [docs/RCA_OUTPUT_CONTRACT.md](docs/RCA_OUTPUT_CONTRACT.md)
 - **Problem statement:** [InMobi/PROBLEM_STATEMENT.md](InMobi/PROBLEM_STATEMENT.md)
 - **Metric definitions:** [InMobi/metrics_glossary.md](InMobi/metrics_glossary.md)
@@ -17,8 +18,12 @@ is computed — not narrated into existence.
 | silver | `inmobi.ad_events_enriched` | denormalised via dictionaries · RCA drill surface |
 | gold | `inmobi.metric_1h` | hourly marginals · **alert surface** (~53K rows) |
 | metric layer | `v_metric_points` | the only place a formula is written |
-| detection | `v_metric_baseline` → `v_metric_deviation` → `v_incidents` | seasonal baseline, guard-railed scoring |
-| state | `anomaly_events` | fired incidents, RCA status, trace URL |
+| detection | `v_metric_baseline` → `v_metric_deviation` | seasonal baseline, guard-railed scoring |
+| alert → agent | ClickStack tile alert on `v_metric_deviation` → webhook → `RCA/app/` | see [docs/RCA_AGENT_DESIGN.md](docs/RCA_AGENT_DESIGN.md) §3 |
+
+No persisted incident table sits between detection and the agent — it
+re-derives everything live per alert. An earlier `v_incidents`/`anomaly_events`
+ledger was removed as a duplicate source of truth.
 
 ## Run
 

@@ -9,9 +9,16 @@ from the webhook onward. The contract between you is
 ## Done already
 
 - `sql/01`–`06`: bronze → silver → gold, metric layer, registry, detection
+  (`v_metric_deviation`; `v_incidents`/`anomaly_events` removed — see
+  `docs/RCA_AGENT_DESIGN.md` §3.3, the agent now re-derives everything live)
 - `scripts/replay.sh`: env-driven, `AD_EVENTS_FILE` at top, optional week shift
+  (curl now streams files via stdin, not `--data-binary @path` — needed in some
+  sandboxed shells)
 - `scripts/suggest_shift.sh`
 - Detector validated: Android 15 z=28.1, iOS 18.1 z=10.6, global fill z=11.4
+- 4 ClickStack alerts (`fill_rate`/`requests`/`ecpm`/`revenue`) + webhook
+  destination, provisioned by hand via the ClickStack MCP — §7 below is
+  superseded by this, not still open
 
 ---
 
@@ -110,15 +117,15 @@ Fill rate varies structurally by app category (utility ~0.75 → gaming ~0.82), 
 traffic composition shift moves the global number with no segment misbehaving.
 Emit both terms per incident; the RCA contract requires the number.
 
-## 7. Alert provisioning from the registry
+## 7. Alert provisioning — done, by hand
 
-Generate ClickStack tiles and alerts **from** `metric_registry` via the ClickStack
-API — do not hand-maintain them. `scripts/provision_clickstack_cloud.py` has the
-auth plumbing; it currently reads a deleted JSON, so repoint it at the registry.
-Needs `RCA_WEBHOOK_URL` in `.env` (no webhook exists on the service yet).
-
-One definition, HyperDX as a render target. Also the honest answer to "can we read
-metric definitions out of HyperDX": no — invert the dependency.
+The 4 tiles + alerts (§"Done already") were provisioned directly via the
+ClickStack MCP against `v_metric_deviation`, one alert per row in
+`metric_registry` with `detector` set (`fill_rate`, `requests`, `ecpm`,
+`revenue`). `scripts/provision_clickstack_cloud.py` still reads a deleted JSON
+and was not used — either fix it to read `metric_registry` so re-provisioning
+after a schema change is scripted, or delete it if the 4 metrics are considered
+stable enough not to need that.
 
 ## 8. Sealed-dataset rehearsal (do NOT skip)
 

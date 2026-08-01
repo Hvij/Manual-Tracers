@@ -5,8 +5,13 @@ everything up to the webhook. Your spec is
 [`RCA_OUTPUT_CONTRACT.md`](RCA_OUTPUT_CONTRACT.md) — read it first, it is the
 definition of done.
 
-**You are not blocked.** The payload schema is fixed (contract §4). Hand-write one
-fixture and build the entire loop against it before real alerts exist.
+**Status:** webhook receiver + investigation ladder through `holdout` are built
+and running in `RCA/app/` — see `docs/RCA_AGENT_DESIGN.md` §3 for what actually
+runs. What's left is narration (§4 below) and Langfuse tracing (§5 below).
+
+**You are not blocked.** The payload schema is fixed (contract §4, now just
+`metric_id=<x>` in the alert body — ClickStack cannot template a data row, see
+`docs/RCA_AGENT_DESIGN.md` §3.1).
 
 ---
 
@@ -25,33 +30,26 @@ Practically: the only LLM call in the whole system is the final `narrate` span.
 
 ## Build order
 
-### 1. Fixture + ledger schema (start here)
+### 1–3. Webhook + investigation ladder — done
 
-Take the payload in contract §4, write it to `fixtures/incident_android15.json`,
-and build the loop against it. Everything downstream is testable offline.
+No fixture file was needed in the end; the loop was built and verified directly
+against the live (later replayed) dataset. `RCA/app/main.py` dedups on
+`hash(title + body)` rather than a `fingerprint` field (ClickStack doesn't
+supply one — see contract §4), same idempotency intent. The ladder is fixed
+sequence, no free-form SQL tool given to any model — every query in
+`investigate.py` is parameterised:
 
-### 2. Webhook receiver
+| Step | Question | Reads | Status |
+|---|---|---|---|
+| `reproduce_global` | is the alerted metric still anomalous, right now? | `v_metric_deviation` | done |
+| `decompose` | which identity factor moved? (revenue only) | `v_metric_deviation` | done |
+| `scan_dims` | which segment, ranked by contribution? | `v_metric_deviation` | done |
+| `holdout_check` | is the top candidate the sole cause? | `ad_events_enriched` | done |
+| interaction (cross 2 dims on a near-100% tie) | — | `ad_events_enriched` | not built |
+| `narrate` | write it up | ledger only | not built |
 
-FastAPI endpoint → validate → dedup on `fingerprint` → enqueue. Idempotent: the
-same fingerprint must not launch two investigations.
-
-### 3. The investigation loop
-
-Fixed sequence, not an agent free-roaming with a SQL tool. Each step is a Langfuse
-span and appends to the ledger:
-
-| Step | Question | Reads |
-|---|---|---|
-| `decompose` | which identity factor moved? | `v_metric_points` |
-| `scan_depth1` | which of the 62 slices? | `metric_1h` |
-| `disambiguate` | is this slice just collateral of another? | `ad_events_enriched` |
-| `scan_depth2` | does a dimension *pair* explain more? | `ad_events_enriched` |
-| `rule_out` | seasonality, mix shift, uniformity | `v_metric_points` |
-| `narrate` | write it up | ledger only |
-
-Use LangChain for orchestration if you like, but **do not** give the model a
-free-form SQL tool. Parameterised queries only. A judge inspecting a trace should
-see deterministic SQL, not model-authored SQL.
+Depth-2 interaction crossing (two dimensions each near 100% of contribution) is
+the one ladder stage from the original design not yet implemented.
 
 ### 4. Narration
 
@@ -77,8 +75,9 @@ Contract §3 has the span shape. Non-negotiables:
 - **Flush before exit.** Langfuse batches. An un-flushed trace on sealed-data night
   means zero on the highest-weighted criterion. Add an explicit flush and verify the
   trace is visible in the UI before declaring done.
-- Write `trace_url` back to `inmobi.anomaly_events` so alert → investigation →
-  diagnosis is followable in one table.
+- Write `trace_url` into a new `rca_reports` table (there is no `anomaly_events`
+  to write back into anymore — see `docs/RCA_AGENT_DESIGN.md` §3.3 / §5) so
+  alert → investigation → diagnosis is followable in one place.
 
 **No trace, no credit.** A perfect diagnosis with a broken trace scores nothing.
 
@@ -92,8 +91,8 @@ wrong and reads as noise. Condition on the parent, check the residual, mark
 collateral.
 
 **Ranking by percentage change.** A tiny slice with a noisy 40% swing will outrank a
-large slice with a real 3% move. Rank by `delta_contribution`
-(`(actual − expected) × traffic_share`). Harsh is delivering this view.
+large slice with a real 3% move. Rank by contribution
+(`Σ |delta_abs| × sample_count`) — `investigate.scan_dims` already does this.
 
 **Simpson's paradox.** Fill rate varies by app category at baseline. A mix shift
 moves the global number with no segment misbehaving. The `mix_shift` check is not
@@ -115,7 +114,8 @@ more than ~50 rows, it is the wrong tool.
 - [ ] `implicated + cleared == candidates_tested`
 - [ ] Handles the no-localising-segment case without inventing a culprit
 - [ ] One Langfuse trace per incident, flushed, with SQL and `query_id` on spans
-- [ ] `trace_url` written back to `anomaly_events`
+- [ ] Diagnosis persisted (a `rca_reports` table — `anomaly_events` was removed,
+      see `docs/RCA_AGENT_DESIGN.md` §3.3, so this needs to be added fresh)
 - [ ] Dry-run rehearsed against a file nobody has seen
 
 ---
@@ -123,20 +123,29 @@ more than ~50 rows, it is the wrong tool.
 ## Interfaces you can rely on
 
 ```sql
--- metric definitions (never restate a formula yourself)
-SELECT * FROM inmobi.v_metric_points
-WHERE metric_id = 'fill_rate' AND dim_name = 'os_version';
+-- metric definition + guard rails (never restate a formula yourself)
+SELECT * FROM inmobi.metric_registry FINAL WHERE metric_id = 'fill_rate';
 
 -- drill order, with rationale
-SELECT dim_name, priority, rationale FROM inmobi.metric_dim_priority
+SELECT dim_name, priority, rationale FROM inmobi.metric_dim_priority FINAL
 WHERE metric_id = 'fill_rate' ORDER BY priority;
 
--- fired incidents
-SELECT * FROM inmobi.v_incidents ORDER BY peak_abs_z DESC;
+-- reproduce the global move: is it still anomalous, right now?
+SELECT ts, actual, expected, z_score, is_anomaly FROM inmobi.v_metric_deviation
+WHERE metric_id = 'fill_rate' AND dim_name = 'ALL'
+  AND ts > {start:DateTime} AND ts <= {end:DateTime} ORDER BY ts;
 
--- write results back
-INSERT INTO inmobi.anomaly_events (fingerprint, rca_status, rca_summary, trace_url) VALUES (...);
+-- per-segment scan, ranked by contribution not percentage change
+SELECT dim_name, dim_value, sum(abs(delta_abs) * sample_count) AS contribution
+FROM inmobi.v_metric_deviation
+WHERE metric_id = 'fill_rate' AND dim_name IN {dims:Array(String)}
+  AND ts > {start:DateTime} AND ts <= {end:DateTime} AND is_anomaly = 1
+GROUP BY dim_name, dim_value ORDER BY contribution DESC;
 ```
 
-Depth-2 drill-downs go against `inmobi.ad_events_enriched` (9M rows, ~2s). Never
-against `ad_events` — the dimensions are not resolved there.
+All three are implemented in `RCA/app/registry.py` / `RCA/app/investigate.py` —
+`get_metric`, `get_dim_priority`, `reproduce_global`, `scan_dims`.
+
+Holdout / depth-2 drill-downs go against `inmobi.ad_events_enriched` (9M rows,
+~2s) — see `investigate.holdout_check`. Never against `ad_events` — the
+dimensions are not resolved there.

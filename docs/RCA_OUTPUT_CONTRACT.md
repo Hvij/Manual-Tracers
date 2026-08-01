@@ -7,6 +7,12 @@ What the agent must produce, and what backs every sentence. Written against
 appears in the report and cannot be traced to a row in the ledger, that is a
 scoring failure worse than missing the anomaly entirely.
 
+**Status:** §1–3 are the target shape; the narrator and Langfuse trace are not
+yet built. `RCA/app/investigate.py` today produces a ledger with the same
+*intent* (candidates ranked by contribution, an exhaustive dim scan, a holdout
+verdict) but different field names — see `docs/RCA_AGENT_DESIGN.md` §3.2 for
+what actually runs. §4 below reflects the real webhook payload.
+
 ---
 
 ## 1. The hypothesis ledger (the only thing the LLM ever sees)
@@ -134,30 +140,30 @@ That is the evidence for "analytical depth in ClickHouse is doing the real work.
 
 ---
 
-## 4. Webhook payload (alert → agent)
+## 4. Webhook payload (alert → agent) — as built
 
-Emitted from `inmobi.anomaly_events`. Deliberately thin: identifiers and the trigger
-only. The agent re-derives everything else from the registry, so no SQL travels over
-the wire and the payload can't drift from the metric layer.
+ClickStack's alert webhook body template supports only `{{title}}`, `{{body}}`,
+`{{link}}` — no per-row or group-by variables (verified against the ClickStack
+alerts docs). So the payload is not a data row at all: it's a static
+`metric_id=<x>` string baked into each alert's message at config time, one
+alert per alertable metric (`fill_rate`, `requests`, `ecpm`, `revenue`).
 
 ```json
 {
-  "anomaly_id": "uuid",
-  "fingerprint": "2026-06-23|fill_rate|os_version|Android 15|drop",
-  "day": "2026-06-23",
-  "metric_id": "fill_rate",
-  "metric_level": 2,
-  "dim_name": "os_version",
-  "dim_value": "Android 15",
-  "direction": "drop",
-  "severity": "critical",
-  "actual": 0.4338,
-  "expected": 0.7849,
-  "delta_rel": -0.4473,
-  "peak_abs_z": 28.1,
-  "anomalous_hours": 24
+  "title": "RCA: fill_rate anomaly",
+  "body": "metric_id=fill_rate",
+  "link": "https://hyperdx.clickhouse.cloud/dashboards/…"
 }
 ```
+
+`RCA/app/main.py` regex-extracts `metric_id`, validates it against
+`metric_registry`, and hands off to `run_investigation(metric_id)` — which
+re-derives the window, the trigger, and every candidate live from
+`v_metric_deviation` / `ad_events_enriched`. Nothing about *which segment* or
+*what value* ever travels over the wire; that's the investigation's job, not
+the alert's. This is a stronger version of the "deliberately thin" principle
+the original design called for — thinner than a `day`/`dim_name`/`dim_value`
+row, because ClickStack cannot template one.
 
 ---
 
