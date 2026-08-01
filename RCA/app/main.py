@@ -1,14 +1,17 @@
 import json
 import logging
+import math
 import re
 
-from fastapi import BackgroundTasks, FastAPI, status
+from fastapi import BackgroundTasks, FastAPI, HTTPException, status
 
 from app import tracing
-from app.investigate import run_investigation
+from app.investigate import reproduce_global, reproduce_segment, run_investigation
 from app.narrate import narrate
 from app.registry import get_metric
-from app.schemas import ClickStackAlertPayload
+from app.report import ledger_to_report
+from app.report_store import persist_report
+from app.schemas import ClickStackAlertPayload, GlobalSeriesRequest, SegmentSeriesRequest
 from app.utils import TTLCache, sha256_hex
 
 METRIC_ID_RE = re.compile(r"metric_id=(\w+)")
@@ -37,14 +40,12 @@ def _extract(pattern: re.Pattern, payload: ClickStackAlertPayload) -> str | None
     return match.group(1) if match else None
 
 
-def _investigate(metric_id: str, dimension_id: str | None) -> None:
+def _investigate(metric_id: str, dimension_id: str | None, payload: ClickStackAlertPayload) -> None:
     ledger = run_investigation(metric_id, dimension_id)
     result = narrate(ledger)
-    logger.info(
-        "investigation for %s -> %s",
-        metric_id,
-        json.dumps({"ledger": ledger, **result}, default=str),
-    )
+    report = ledger_to_report(ledger, payload, result)
+    persist_report(report)
+    logger.info("investigation for %s -> %s", metric_id, json.dumps(report, default=str))
     tracing.flush()
 
 
@@ -67,9 +68,42 @@ async def receive_alert(payload: ClickStackAlertPayload, background_tasks: Backg
         return {"status": "accepted", "delivery_key": key, "investigation": "unknown_metric"}
 
     dimension_id = _extract(DIMENSION_ID_RE, payload)
-    background_tasks.add_task(_investigate, metric_id, dimension_id)
+    background_tasks.add_task(_investigate, metric_id, dimension_id, payload)
     return {"status": "accepted", "delivery_key": key, "investigation": "started",
             "metric_id": metric_id, "dimension_id": dimension_id}
+
+
+def _json_safe(rows: list[dict]) -> list[dict]:
+    """A bucket without enough baseline history yet (MIN_BASE_POINTS) has expected/z_score
+    = NaN — fine internally, but Starlette's JSONResponse rejects NaN as invalid JSON and
+    500s the whole request. NaN/Infinity mean the same thing JSON's null already means here:
+    no value to report."""
+    return [
+        {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in row.items()}
+        for row in rows
+    ]
+
+
+# docs/RCA_UI_TEMPLATE.md Step 3 — rca-api proxies its chart endpoints to these instead of
+# querying ClickHouse itself, so credentials stay in exactly one process (this one).
+@app.post("/internal/global-series")
+def global_series(req: GlobalSeriesRequest):
+    if get_metric(req.metric_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}")
+    return _json_safe(reproduce_global(req.metric_id, req.start, req.end))
+
+
+@app.post("/internal/segment-series")
+def segment_series(req: SegmentSeriesRequest):
+    if get_metric(req.metric_id) is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}")
+    try:
+        rows = reproduce_segment(req.metric_id, req.dim_name, req.start, req.end)
+    except ValueError as e:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
+    if req.dim_values:
+        rows = [r for r in rows if r["dim_value"] in req.dim_values]
+    return _json_safe(rows)
 
 
 if __name__ == "__main__":

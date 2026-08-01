@@ -41,9 +41,11 @@ export function RcaList({ reports, selectedId, onSelect }: Props) {
                 <Badge variant="secondary" className="text-[10px] font-normal">
                   {r.status}
                 </Badge>
-                <span className="font-mono text-[10px] text-muted-foreground">
-                  |z| {r.peak_abs_z.toFixed(1)}
-                </span>
+                {r.peak_abs_z !== undefined && (
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    |z| {r.peak_abs_z.toFixed(1)}
+                  </span>
+                )}
               </div>
               <p className="mt-1 font-mono text-[10px] text-muted-foreground">
                 {fmtDate(r.created_at)}

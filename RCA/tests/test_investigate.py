@@ -1,4 +1,5 @@
 import math
+from unittest.mock import patch
 
 import pytest
 
@@ -6,6 +7,7 @@ from app.investigate import (
     compute_factor_contributions,
     compute_holdout_verdict,
     compute_interaction,
+    holdout_check,
     _log_growth,
 )
 
@@ -31,6 +33,23 @@ def test_inconclusive_when_candidate_delta_is_zero():
 def test_ratio_threshold_is_a_boundary():
     assert compute_holdout_verdict(candidate_delta=-1.0, residual_delta=0.25, ratio_threshold=0.25) == "localized"
     assert compute_holdout_verdict(candidate_delta=-1.0, residual_delta=0.2500001, ratio_threshold=0.25) == "inconclusive"
+
+
+def test_holdout_check_null_complement_is_inconclusive_not_a_crash():
+    # the candidate is ~all the traffic in this window (a real, reachable state on a narrow
+    # analysis window, not just a test artifact) -> nullIf(count(),0) makes value_sql return
+    # NULL for the complement. residual_actual - global_expected_ref used to crash on
+    # None - float; with no complement to hold out against, this is inconclusive, not an error.
+    with patch("app.investigate.get_metric", return_value={"sql": "sum(is_filled)/nullIf(count(),0)"}), \
+         patch("app.investigate.known_dims", return_value=frozenset({"os_version"})), \
+         patch("app.investigate.query_rows", return_value=[{"value": None, "sample_count": 0}]):
+        result = holdout_check(
+            "fill_rate", [{"dim_name": "os_version", "dim_value": "Android 15"}],
+            candidate_delta=-0.35, global_expected_ref=0.785, start="2026-08-01", end="2026-08-01",
+        )
+    assert result["residual_actual"] is None
+    assert result["residual_delta"] is None
+    assert result["verdict"] == "inconclusive"
 
 
 def test_log_growth_is_exact_log_ratio():

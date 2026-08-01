@@ -16,7 +16,8 @@ function fmtWindow(w: { start: string; end: string }) {
 }
 
 export function TriggerCard({ trigger, status }: Props) {
-  const delta = trigger.actual - trigger.expected;
+  const hasSignal = trigger.actual !== undefined && trigger.expected !== undefined;
+  const delta = hasSignal ? trigger.actual! - trigger.expected! : undefined;
 
   return (
     <article className="border border-border bg-card/20">
@@ -48,20 +49,31 @@ export function TriggerCard({ trigger, status }: Props) {
             Window
           </p>
           <p className="mt-1 font-mono text-xs text-foreground">{fmtWindow(trigger.window)}</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">{trigger.hours} hours</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {trigger.hours !== undefined ? `${trigger.hours} hours` : "—"}
+          </p>
         </div>
         <div>
           <p className="flex items-center gap-1 text-[11px] uppercase tracking-wide text-muted-foreground">
             <Zap className="h-3 w-3" aria-hidden />
             Signal
           </p>
-          <p className="mt-1 font-mono text-sm tabular-nums text-foreground">
-            {fmtPct(trigger.actual)} vs {fmtPct(trigger.expected)}
-          </p>
-          <p className="mt-0.5 font-mono text-xs text-muted-foreground">
-            Δ {delta >= 0 ? "+" : ""}
-            {(delta * 100).toFixed(2)}pp · peak |z| {trigger.peak_abs_z.toFixed(1)}
-          </p>
+          {hasSignal ? (
+            <>
+              <p className="mt-1 font-mono text-sm tabular-nums text-foreground">
+                {fmtPct(trigger.actual!)} vs {fmtPct(trigger.expected!)}
+              </p>
+              <p className="mt-0.5 font-mono text-xs text-muted-foreground">
+                Δ {delta! >= 0 ? "+" : ""}
+                {(delta! * 100).toFixed(2)}pp
+                {trigger.peak_abs_z !== undefined && ` · peak |z| ${trigger.peak_abs_z.toFixed(1)}`}
+              </p>
+            </>
+          ) : (
+            <p className="mt-1 text-sm text-muted-foreground">
+              No finding — alert did not reproduce against current data.
+            </p>
+          )}
         </div>
       </div>
     </article>

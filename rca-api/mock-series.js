@@ -147,4 +147,8 @@ module.exports = {
   globalMetricSeries,
   segmentSeries,
   contributionBars,
+  // exported so live-series.js can bucket + roll up real rows the same way as the mock path
+  bucketKey,
+  aggregateByBucket,
+  aggregateSegment,
 };

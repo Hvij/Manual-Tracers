@@ -73,6 +73,10 @@ local_settings.py
 db.sqlite3
 db.sqlite3-journal
 
+
+# Persisted RCA reports (docs/RCA_UI_TEMPLATE.md Step 2) — generated at runtime, not source
+/data/rca_reports/
+
 # Flask stuff:
 instance/
 .webassets-cache

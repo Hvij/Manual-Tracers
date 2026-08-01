@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
     langfuse_base_url: str | None = None
 
+    # Where persist_report() writes — docs/RCA_UI_TEMPLATE.md Step 2 (Option A). Default
+    # matches local dev (RCA/app runs on the host); Docker overrides via RCA_REPORTS_DIR
+    # to the shared volume mounted into rca-api (docker-compose.yml).
+    rca_reports_dir: Path = Path(__file__).resolve().parents[2] / "data" / "rca_reports"
+
     @property
     def langfuse_configured(self) -> bool:
         return bool(self.langfuse_public_key and self.langfuse_secret_key)

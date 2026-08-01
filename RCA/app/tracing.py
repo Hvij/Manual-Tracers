@@ -1,10 +1,52 @@
 import logging
+from urllib.parse import urlparse
 
 from app.settings import get_settings
 
 logger = logging.getLogger("rca_agent.tracing")
 
 _client = None
+
+
+def _disable_tls_verify_for_langfuse() -> None:
+    """Inside the rca-agent container, exporting to Langfuse fails with
+    SSLCertVerificationError('self-signed certificate in certificate chain') — a corporate
+    proxy intercepting outbound TLS with a root cert the container's minimal image doesn't
+    trust (the host's own Python trusts it fine via the OS store; python:3.13-slim doesn't
+    ship it). Langfuse builds its OTLP exporter's requests.Session internally — including
+    the one @observe's global client uses, which is created on first span, before anything
+    in this module gets a chance to run get_langfuse() — so the only hook available is a
+    patch on requests.Session itself, applied at import time (before ANY such session can
+    be built) rather than lazily inside get_langfuse().
+
+    Scoped to just the Langfuse host via merge_environment_settings, not a blanket
+    Session.verify=False: google.genai's requests-based paths share this same process."""
+    import requests
+
+    if getattr(requests.Session, "_rca_langfuse_tls_patched", False):
+        return
+
+    langfuse_host = urlparse(
+        get_settings().langfuse_base_url or "https://us.cloud.langfuse.com"
+    ).hostname
+    original_merge = requests.Session.merge_environment_settings
+
+    def merge_environment_settings(self, url, proxies, stream, verify, cert):
+        settings = original_merge(self, url, proxies, stream, verify, cert)
+        if urlparse(url).hostname == langfuse_host:
+            settings["verify"] = False
+        return settings
+
+    requests.Session.merge_environment_settings = merge_environment_settings
+    requests.Session._rca_langfuse_tls_patched = True
+
+    import urllib3
+
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+if get_settings().langfuse_configured:
+    _disable_tls_verify_for_langfuse()
 
 
 def get_langfuse():

@@ -15,7 +15,8 @@ export interface RcaReportSummary {
   status: string;
   metric_id: string;
   window: { start: string; end: string };
-  peak_abs_z: number;
+  // absent when the verdict is not_reproducible — no finding means no peak z to report
+  peak_abs_z?: number;
 }
 
 export interface RcaTrigger {
@@ -24,10 +25,11 @@ export interface RcaTrigger {
   alert_body: string;
   window: { start: string; end: string };
   dimension_hint?: string;
-  actual: number;
-  expected: number;
-  peak_abs_z: number;
-  hours: number;
+  // absent when the verdict is not_reproducible — no finding means no global summary to report
+  actual?: number;
+  expected?: number;
+  peak_abs_z?: number;
+  hours?: number;
 }
 
 export interface RcaCandidate {
@@ -53,13 +55,16 @@ export interface RcaReport extends RcaReportSummary {
   };
   ruled_out: RcaRuledOut[];
   candidates: RcaCandidate[];
+  // null when the verdict is not_reproducible — no finding means no holdout was ever run
   holdout: {
     candidate: Array<{ dim_name: string; dim_value: string }>;
-    residual_actual: number;
-    residual_delta: number;
+    // null when the complement matched zero rows (candidate is ~all the traffic in this
+    // window) — the comparison genuinely couldn't be made
+    residual_actual: number | null;
+    residual_delta: number | null;
     candidate_delta: number;
     verdict: string;
-  };
+  } | null;
   ledger: Record<string, unknown>;
 }
 

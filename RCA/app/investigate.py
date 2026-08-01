@@ -68,6 +68,21 @@ def reproduce_global(metric_id: str, start, end) -> list[dict]:
     )
 
 
+@traced("reproduce_segment")
+def reproduce_segment(metric_id: str, dim_name: str, start, end) -> list[dict]:
+    """Per-value series for one dimension — feeds the UI's segment-series chart
+    (docs/RCA_UI_TEMPLATE.md), not the investigation ladder itself. dim_name arrives from
+    outside (rca-ui -> rca-api -> here), so it goes through the same _dim_col whitelist as
+    every other externally-reachable dimension reference before it is spliced into SQL."""
+    meta = get_metric(metric_id)
+    col = _dim_col(dim_name)
+    return query_rows(
+        "SELECT ts, dim_value, actual, expected, z_score, delta_rel, is_anomaly "
+        f"FROM ({_deviation(meta, [col])}) ORDER BY dim_value, ts",
+        _window_params(start, end),
+    )
+
+
 def _anomalous(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r["is_anomaly"]]
 
@@ -198,14 +213,19 @@ def holdout_check(metric_id: str, conditions: list[dict], candidate_delta: float
               f"AND NOT ({' AND '.join(clauses)})")
     rows = query_rows(metric_sql.value_sql(meta, where), params)
     residual_actual = rows[0]["value"]
-    residual_delta = residual_actual - global_expected_ref
+    # None when the complement matches zero rows (the candidate is ~all the traffic in this
+    # window) — nullIf(count(),0) in metric_def.sql, same guard every ratio metric already
+    # uses for a dead bucket. No complement means nothing to hold out against: inconclusive,
+    # not a crash.
+    residual_delta = None if residual_actual is None else residual_actual - global_expected_ref
 
     return {
         "candidate": [{"dim_name": c["dim_name"], "dim_value": c["dim_value"]} for c in conditions],
         "residual_actual": residual_actual,
         "residual_delta": residual_delta,
         "candidate_delta": candidate_delta,
-        "verdict": compute_holdout_verdict(candidate_delta, residual_delta),
+        "verdict": ("inconclusive" if residual_delta is None
+                     else compute_holdout_verdict(candidate_delta, residual_delta)),
     }
 
 

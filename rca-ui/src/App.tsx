@@ -177,40 +177,57 @@ export default function App() {
                 </RcaSection>
 
                 <RcaSection title="Why it happened">
-                  {report.sections.why_it_happened}
-                  <div className="mt-3 rounded-sm border border-border bg-muted/20 p-3 font-mono text-xs text-muted-foreground">
-                    Holdout: residual {report.holdout.residual_actual.toFixed(4)} (Δ{" "}
-                    {report.holdout.residual_delta.toFixed(4)}) · candidate Δ{" "}
-                    {report.holdout.candidate_delta.toFixed(4)} · verdict{" "}
-                    {report.holdout.verdict}
-                  </div>
+                  {report.sections.why_it_happened || "No finding — nothing to explain."}
+                  {report.holdout && (
+                    <div className="mt-3 rounded-sm border border-border bg-muted/20 p-3 font-mono text-xs text-muted-foreground">
+                      {/* residual_actual/residual_delta are null when the holdout complement
+                          matched zero rows (candidate is ~all the traffic in this window) —
+                          the comparison genuinely couldn't be made, not just "no finding" */}
+                      Holdout: residual{" "}
+                      {report.holdout.residual_actual !== null
+                        ? report.holdout.residual_actual.toFixed(4)
+                        : "n/a"}{" "}
+                      (Δ{" "}
+                      {report.holdout.residual_delta !== null
+                        ? report.holdout.residual_delta.toFixed(4)
+                        : "n/a"}
+                      ) · candidate Δ {report.holdout.candidate_delta.toFixed(4)} · verdict{" "}
+                      {report.holdout.verdict}
+                    </div>
+                  )}
                 </RcaSection>
 
-                <RcaSection
-                  title="Supporting data"
-                  icon={<ClipboardList className="h-4 w-4 text-muted-foreground" aria-hidden />}
-                >
-                  {report.sections.supporting_data_summary}
-                </RcaSection>
+                {report.sections.supporting_data_summary && (
+                  <RcaSection
+                    title="Supporting data"
+                    icon={<ClipboardList className="h-4 w-4 text-muted-foreground" aria-hidden />}
+                  >
+                    {report.sections.supporting_data_summary}
+                  </RcaSection>
+                )}
 
-                <div className="grid gap-4 lg:grid-cols-2">
-                  <GlobalMetricChart
-                    title={`Global ${report.trigger.metric_id} — actual vs expected`}
-                    rows={globalSeries}
-                    loading={chartLoading}
-                  />
-                  <SegmentTrendChart rows={segmentSeries} loading={chartLoading} />
-                </div>
+                {report.candidates.length > 0 && (
+                  <>
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <GlobalMetricChart
+                        title={`Global ${report.trigger.metric_id} — actual vs expected`}
+                        rows={globalSeries}
+                        loading={chartLoading}
+                      />
+                      <SegmentTrendChart rows={segmentSeries} loading={chartLoading} />
+                    </div>
 
-                <div className="grid gap-4 lg:grid-cols-2">
-                  <ContributionChart rows={contributions} loading={chartLoading} />
-                  <CandidateTable rows={report.candidates} />
-                </div>
+                    <div className="grid gap-4 lg:grid-cols-2">
+                      <ContributionChart rows={contributions} loading={chartLoading} />
+                      <CandidateTable rows={report.candidates} />
+                    </div>
 
-                <RuledOutList
-                  items={report.ruled_out}
-                  candidatesTested={report.candidates.length}
-                />
+                    <RuledOutList
+                      items={report.ruled_out}
+                      candidatesTested={report.candidates.length}
+                    />
+                  </>
+                )}
               </main>
             </>
           )}
