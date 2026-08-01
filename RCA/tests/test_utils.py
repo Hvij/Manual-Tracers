@@ -8,8 +8,8 @@ def test_sha256_hex_is_deterministic_and_order_sensitive():
 
 def test_ttlcache_flags_a_repeat_key_as_seen():
     cache = TTLCache(ttl_seconds=300)
-    assert cache.seen("k") is False   # first time: not a duplicate
-    assert cache.seen("k") is True    # second time: duplicate
+    assert cache.seen("k") is False  # first time: not a duplicate
+    assert cache.seen("k") is True  # second time: duplicate
 
 
 def test_ttlcache_evicts_after_ttl_expires(monkeypatch):
@@ -35,5 +35,12 @@ def test_content_to_text_handles_plain_string():
 
 def test_content_to_text_handles_gemini_style_content_blocks():
     # ChatGoogleGenerativeAI can return response.content as a list of parts, not a str
-    assert content_to_text([{"type": "text", "text": "part one "}, {"type": "text", "text": "part two"}]) \
+    assert (
+        content_to_text(
+            [
+                {"type": "text", "text": "part one "},
+                {"type": "text", "text": "part two"},
+            ]
+        )
         == "part one part two"
+    )

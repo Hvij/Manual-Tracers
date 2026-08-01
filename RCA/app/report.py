@@ -14,7 +14,11 @@ from datetime import datetime, timezone
 
 from app.schemas import ClickStackAlertPayload
 
-EMPTY_SECTIONS = {"what_went_wrong": "", "why_it_happened": "", "supporting_data_summary": ""}
+EMPTY_SECTIONS = {
+    "what_went_wrong": "",
+    "why_it_happened": "",
+    "supporting_data_summary": "",
+}
 
 
 def split_narrative(text: str, ledger: dict) -> dict:
@@ -36,7 +40,7 @@ def split_narrative(text: str, ledger: dict) -> dict:
         what_went_wrong.append(paragraphs[i])
         i += 1
 
-    why_it_happened = paragraphs[i:i + n_findings]
+    why_it_happened = paragraphs[i : i + n_findings]
     i += len(why_it_happened)
 
     supporting_data_summary = paragraphs[i:]
@@ -53,21 +57,30 @@ def _holdout_reason(finding: dict, ruled_out_entry: str) -> str:
     sample reports and the real pipeline produce the same reason shape."""
     dim_name, _, dim_value = ruled_out_entry.partition("=")
     candidate = next(
-        (c for c in finding["candidates"]
-         if c["dim_name"] == dim_name and c["dim_value"] == dim_value),
+        (
+            c
+            for c in finding["candidates"]
+            if c["dim_name"] == dim_name and c["dim_value"] == dim_value
+        ),
         None,
     )
     if candidate is None:
-        return ("Tested at depth 1; movement did not localize to this segment after "
-                "conditioning on the primary culprit.")
+        return (
+            "Tested at depth 1; movement did not localize to this segment after "
+            "conditioning on the primary culprit."
+        )
     top = finding["candidates"][0]
     residual_delta = finding["holdout"]["residual_delta"]
-    return (f"Holdout residual ({residual_delta:.4f}) did not move with this slice; "
-            f"contribution {candidate['contribution']:.0f} is a correlated follower "
-            f"of {top['dim_name']}={top['dim_value']}.")
+    return (
+        f"Holdout residual ({residual_delta:.4f}) did not move with this slice; "
+        f"contribution {candidate['contribution']:.0f} is a correlated follower "
+        f"of {top['dim_name']}={top['dim_value']}."
+    )
 
 
-def ledger_to_report(ledger: dict, alert: ClickStackAlertPayload, narrative: dict) -> dict:
+def ledger_to_report(
+    ledger: dict, alert: ClickStackAlertPayload, narrative: dict
+) -> dict:
     """docs/RCA_UI_TEMPLATE.md §"Step 1 — Map ledger → report template". Only the first
     finding feeds the top-level candidates/holdout/ruled_out fields — the template's own
     schema is singular there, same simplification the doc's reference pseudocode makes."""
@@ -84,8 +97,14 @@ def ledger_to_report(ledger: dict, alert: ClickStackAlertPayload, narrative: dic
     }
     if finding:
         g = finding["global"]
-        trigger.update({"actual": g["actual"], "expected": g["expected"],
-                          "peak_abs_z": g["peak_abs_z"], "hours": g["hours"]})
+        trigger.update(
+            {
+                "actual": g["actual"],
+                "expected": g["expected"],
+                "peak_abs_z": g["peak_abs_z"],
+                "hours": g["hours"],
+            }
+        )
 
     ruled_out = [
         {"segment": s, "reason": _holdout_reason(finding, s)}

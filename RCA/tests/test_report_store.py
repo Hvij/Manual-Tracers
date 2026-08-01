@@ -2,7 +2,11 @@ import json
 
 from app.report_store import persist_report
 
-REPORT = {"id": "rca-fill_rate-abcd1234", "status": "localized", "trigger": {"metric_id": "fill_rate"}}
+REPORT = {
+    "id": "rca-fill_rate-abcd1234",
+    "status": "localized",
+    "trigger": {"metric_id": "fill_rate"},
+}
 
 
 def test_persist_report_writes_one_json_file_named_by_id(tmp_path):

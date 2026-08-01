@@ -32,7 +32,9 @@ def round_floats(obj, ndigits: int = ROUND_NDIGITS):
 def fallback_summary(ledger: dict) -> str:
     """Built directly from the ledger, no LLM — used when narrate has nothing to say
     (unreproduced/undecomposed alerts) or when the LLM's output fails the grounding check."""
-    lines = [f"Diagnosis for {ledger.get('metric_id')}: verdict={ledger.get('verdict', 'unknown')}."]
+    lines = [
+        f"Diagnosis for {ledger.get('metric_id')}: verdict={ledger.get('verdict', 'unknown')}."
+    ]
 
     window = ledger.get("window")
     if window:
@@ -54,8 +56,10 @@ def fallback_summary(ledger: dict) -> str:
         )
         holdout = finding.get("holdout")
         if holdout:
-            lines.append(f"    top candidate: {_slice_name(holdout['candidate'])} "
-                          f"(holdout: {holdout['verdict']})")
+            lines.append(
+                f"    top candidate: {_slice_name(holdout['candidate'])} "
+                f"(holdout: {holdout['verdict']})"
+            )
         interaction = finding.get("interaction") or {}
         if interaction.get("top"):
             lines.append(
@@ -65,8 +69,10 @@ def fallback_summary(ledger: dict) -> str:
             )
             crossed = interaction.get("holdout")
             if crossed:
-                lines.append(f"    crossed candidate: {_slice_name(crossed['candidate'])} "
-                              f"(holdout: {crossed['verdict']})")
+                lines.append(
+                    f"    crossed candidate: {_slice_name(crossed['candidate'])} "
+                    f"(holdout: {crossed['verdict']})"
+                )
 
     return "\n".join(lines)
 

@@ -19,6 +19,7 @@ like the rest of this system reads its own registry rather than restating it.
 
 Depends on nothing outside the standard library, same as metric_query.py.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -60,14 +61,20 @@ def query(env: dict, sql: str) -> list:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--bucket-seconds", type=int, default=1,
-                     help="wall-clock seconds per data-hour (default: 1 -> ~14 min for 840h)")
+    ap.add_argument(
+        "--bucket-seconds",
+        type=int,
+        default=1,
+        help="wall-clock seconds per data-hour (default: 1 -> ~14 min for 840h)",
+    )
     args = ap.parse_args()
     bucket_seconds = args.bucket_seconds
 
     env = load_env()
 
-    anchor = int(query(env, "SELECT toUnixTimestamp(now()) AS t FORMAT JSONEachRow")[0]["t"])
+    anchor = int(
+        query(env, "SELECT toUnixTimestamp(now()) AS t FORMAT JSONEachRow")[0]["t"]
+    )
 
     bounds = query(
         env,
@@ -81,21 +88,30 @@ def main() -> int:
     total_hours = int(bounds["hours"])
     window_seconds = total_hours * bucket_seconds
 
-    print(f"compressing {total_hours} data-hours into {window_seconds}s "
-          f"({window_seconds / 60:.1f} min) of wall-clock time, starting now "
-          f"({datetime.fromtimestamp(anchor, tz=timezone.utc).isoformat()})")
+    print(
+        f"compressing {total_hours} data-hours into {window_seconds}s "
+        f"({window_seconds / 60:.1f} min) of wall-clock time, starting now "
+        f"({datetime.fromtimestamp(anchor, tz=timezone.utc).isoformat()})"
+    )
 
     print("staging a copy of ad_events ...")
     execute(env, "DROP TABLE IF EXISTS inmobi.ad_events_staging")
-    execute(env, "CREATE TABLE inmobi.ad_events_staging ENGINE = MergeTree ORDER BY event_time "
-                 "AS SELECT * FROM inmobi.ad_events")
+    execute(
+        env,
+        "CREATE TABLE inmobi.ad_events_staging ENGINE = MergeTree ORDER BY event_time "
+        "AS SELECT * FROM inmobi.ad_events",
+    )
 
     print("truncating ad_events + ad_events_enriched ...")
     execute(env, "TRUNCATE TABLE inmobi.ad_events")
     execute(env, "TRUNCATE TABLE inmobi.ad_events_enriched")
 
-    print("re-inserting with compressed event_time (MV1 repopulates ad_events_enriched) ...")
-    execute(env, f"""
+    print(
+        "re-inserting with compressed event_time (MV1 repopulates ad_events_enriched) ..."
+    )
+    execute(
+        env,
+        f"""
 INSERT INTO inmobi.ad_events
 SELECT
     toDateTime64({anchor} + intDiv(toUnixTimestamp(event_time) - {data_start}, 3600)
@@ -103,20 +119,31 @@ SELECT
     app_id, geo_device_id, advertiser_id, ad_format,
     is_filled, is_impression, is_click, revenue
 FROM inmobi.ad_events_staging
-""")
+""",
+    )
 
     print("dropping staging table ...")
     execute(env, "DROP TABLE inmobi.ad_events_staging")
 
     print("updating inmobi.replay_clock ...")
-    execute(env, "INSERT INTO inmobi.replay_clock (bucket_seconds, anchor, origin_dow) "
-                 f"VALUES ({bucket_seconds}, {anchor}, {origin_dow})")
+    execute(
+        env,
+        "INSERT INTO inmobi.replay_clock (bucket_seconds, anchor, origin_dow) "
+        f"VALUES ({bucket_seconds}, {anchor}, {origin_dow})",
+    )
 
-    rows = query(env, "SELECT count() AS n, toString(min(event_time)) AS lo, "
-                       "toString(max(event_time)) AS hi FROM inmobi.ad_events_enriched "
-                       "FORMAT JSONEachRow")[0]
-    print(f"done. ad_events_enriched: {rows['n']} rows, event_time {rows['lo']} .. {rows['hi']}")
-    print(f"replay_clock: bucket_seconds={bucket_seconds} anchor={anchor} origin_dow={origin_dow}")
+    rows = query(
+        env,
+        "SELECT count() AS n, toString(min(event_time)) AS lo, "
+        "toString(max(event_time)) AS hi FROM inmobi.ad_events_enriched "
+        "FORMAT JSONEachRow",
+    )[0]
+    print(
+        f"done. ad_events_enriched: {rows['n']} rows, event_time {rows['lo']} .. {rows['hi']}"
+    )
+    print(
+        f"replay_clock: bucket_seconds={bucket_seconds} anchor={anchor} origin_dow={origin_dow}"
+    )
     return 0
 
 

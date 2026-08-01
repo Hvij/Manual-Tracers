@@ -9,6 +9,7 @@ Requires in .env:
 
 Optional: reads docs/inmobi_dashboard_import.json for tiles/source.
 """
+
 from __future__ import annotations
 
 import base64
@@ -141,12 +142,9 @@ def main() -> None:
     source_id = None
     for s in src_list:
         frm = s.get("from") or {}
-        if (
-            s.get("name") == source_spec["name"]
-            or (
-                frm.get("databaseName") == "inmobi"
-                and frm.get("tableName") == "ad_events_enriched"
-            )
+        if s.get("name") == source_spec["name"] or (
+            frm.get("databaseName") == "inmobi"
+            and frm.get("tableName") == "ad_events_enriched"
         ):
             source_id = s.get("id")
             print(f"  reuse source {source_id} ({s.get('name')})")

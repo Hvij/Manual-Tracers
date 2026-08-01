@@ -46,4 +46,6 @@ def content_to_text(content) -> str:
     return a str, but some (Gemini included) can return a list of content-block parts."""
     if isinstance(content, str):
         return content
-    return "".join(part if isinstance(part, str) else part.get("text", "") for part in content)
+    return "".join(
+        part if isinstance(part, str) else part.get("text", "") for part in content
+    )

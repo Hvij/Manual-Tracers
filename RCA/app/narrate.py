@@ -4,7 +4,12 @@ import logging
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_google_genai import ChatGoogleGenerativeAI
 
-from app.grounding import allowed_numbers, check_grounding, fallback_summary, round_floats
+from app.grounding import (
+    allowed_numbers,
+    check_grounding,
+    fallback_summary,
+    round_floats,
+)
 from app.settings import get_settings
 from app.tracing import traced
 from app.utils import content_to_text
@@ -49,14 +54,22 @@ Hard rules:
 
 
 @traced("narrate")
-def narrate(ledger: dict) -> dict:
+async def narrate(ledger: dict) -> dict:
     if not ledger.get("findings"):
-        return {"narrative": fallback_summary(ledger), "grounded": True, "source": "template"}
+        return {
+            "narrative": fallback_summary(ledger),
+            "grounded": True,
+            "source": "template",
+        }
 
     settings = get_settings()
     if not settings.gemini_api_key:
         logger.warning("GEMINI_API_KEY not set — falling back to templated summary")
-        return {"narrative": fallback_summary(ledger), "grounded": True, "source": "template"}
+        return {
+            "narrative": fallback_summary(ledger),
+            "grounded": True,
+            "source": "template",
+        }
 
     rounded = round_floats(ledger)
     allowed = allowed_numbers(rounded)
@@ -65,14 +78,23 @@ def narrate(ledger: dict) -> dict:
         google_api_key=settings.gemini_api_key,
         temperature=0,  # copy numbers verbatim, never embellish
     )
-    response = llm.invoke(
-        [SystemMessage(content=SYSTEM_PROMPT), HumanMessage(content=json.dumps(rounded, default=str))]
+    response = await llm.ainvoke(
+        [
+            SystemMessage(content=SYSTEM_PROMPT),
+            HumanMessage(content=json.dumps(rounded, default=str)),
+        ]
     )
     text = content_to_text(response.content)
 
     ungrounded = check_grounding(text, allowed)
     if ungrounded:
-        logger.warning("ungrounded numbers %s — falling back to templated summary", ungrounded)
-        return {"narrative": fallback_summary(ledger), "grounded": False, "ungrounded_numbers": ungrounded}
+        logger.warning(
+            "ungrounded numbers %s — falling back to templated summary", ungrounded
+        )
+        return {
+            "narrative": fallback_summary(ledger),
+            "grounded": False,
+            "ungrounded_numbers": ungrounded,
+        }
 
     return {"narrative": text, "grounded": True, "source": "llm"}

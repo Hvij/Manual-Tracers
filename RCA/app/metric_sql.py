@@ -13,9 +13,9 @@ Spread is a robust IQR rather than stddev, so a planted incident inside the
 lookback cannot inflate the band and mask itself.
 """
 
-HISTORY_WEEKS = 10       # enough for 20 same-hour, same-day-type points on weekends too
+HISTORY_WEEKS = 10  # enough for 20 same-hour, same-day-type points on weekends too
 BASELINE_POINTS = 20
-MIN_BASE_POINTS = 8      # below this the baseline is not worth scoring against
+MIN_BASE_POINTS = 8  # below this the baseline is not worth scoring against
 
 # A "bucket" is one data-hour. In real time that is 3600 wall-clock seconds; in a
 # compressed replay (scripts/compress_replay.py) it is fewer, so 35 days of history can
@@ -38,8 +38,11 @@ def _clock_exprs(clock: dict | None) -> tuple[str, str, str]:
     if not clock or int(clock["bucket_seconds"]) == REAL_BUCKET_SECONDS:
         return "toStartOfHour(event_time)", "toHour(ts)", "toDayOfWeek(ts) >= 6"
 
-    size, anchor, origin_dow = (int(clock["bucket_seconds"]), int(clock["anchor"]),
-                                 int(clock["origin_dow"]))
+    size, anchor, origin_dow = (
+        int(clock["bucket_seconds"]),
+        int(clock["anchor"]),
+        int(clock["origin_dow"]),
+    )
     idx = f"intDiv(toUnixTimestamp(ts) - {anchor}, {size})"
     return (
         f"toDateTime(intDiv(toUnixTimestamp(event_time) - {anchor}, {size}) * {size} + {anchor})",
@@ -62,7 +65,9 @@ def dim_tuples(dims: list[str]) -> str:
     """ARRAY JOIN fan-out: one output row per (bucket, dimension). 'ALL' is the global
     bucket. toString() because the columns are LowCardinality and a tuple array literal
     needs one common type."""
-    return ", ".join("('ALL', '')" if d == "ALL" else f"('{d}', toString({d}))" for d in dims)
+    return ", ".join(
+        "('ALL', '')" if d == "ALL" else f"('{d}', toString({d}))" for d in dims
+    )
 
 
 def _expected_and_z(meta: dict) -> tuple[str, str]:
@@ -75,11 +80,20 @@ def _expected_and_z(meta: dict) -> tuple[str, str]:
             "if(den > 0 AND base_den > 0, proportionsZTest(toUInt64(num), toUInt64(base_num), "
             "toUInt64(den), toUInt64(base_den), 0.999, 'unpooled').1, NULL)",
         )
-    return "base_median", "if(expected IS NULL, NULL, (actual - expected) / robust_sigma)"
+    return (
+        "base_median",
+        "if(expected IS NULL, NULL, (actual - expected) / robust_sigma)",
+    )
 
 
-def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end: str,
-                   clock: dict | None = None) -> str:
+def deviation_sql(
+    meta: dict,
+    dims: list[str],
+    hist_start: str,
+    start: str,
+    end: str,
+    clock: dict | None = None,
+) -> str:
     """Hourly series for `dims`, scored against its own seasonal baseline.
 
     `hist_start` / `start` / `end` are SQL fragments, not values: the agent passes bound
@@ -92,15 +106,17 @@ def deviation_sql(meta: dict, dims: list[str], hist_start: str, start: str, end:
     den_expr = meta["denominator"] or "0"
     # an absolute floor of 0 means "no floor" — emit no clause rather than `0 = 0`
     effect_abs = float(meta["min_effect_abs"])
-    effect_abs_clause = (f"\n              AND abs(delta_abs) >= {effect_abs}") if effect_abs else ""
+    effect_abs_clause = (
+        (f"\n              AND abs(delta_abs) >= {effect_abs}") if effect_abs else ""
+    )
 
     return f"""
 WITH points AS (
     SELECT {bucket_expr} AS ts,
            d.1 AS dim_name,
            d.2 AS dim_value,
-           {meta['sql']} AS actual,
-           {meta['numerator']} AS num,
+           {meta["sql"]} AS actual,
+           {meta["numerator"]} AS num,
            {den_expr} AS den,
            count() AS sample_count
     FROM inmobi.ad_events_enriched
@@ -144,10 +160,10 @@ scored AS (
 )
 SELECT ts, dim_name, dim_value, actual, expected, delta_abs, delta_rel, z_score,
        sample_count, base_points,
-       ifNull(sample_count >= {int(meta['min_samples'])}
+       ifNull(sample_count >= {int(meta["min_samples"])}
               AND base_points >= {MIN_BASE_POINTS}
-              AND abs(z_score) >= {float(meta['z_score_threshold'])}
-              AND abs(delta_rel) >= {float(meta['min_effect_rel'])}{effect_abs_clause}, 0) AS is_anomaly
+              AND abs(z_score) >= {float(meta["z_score_threshold"])}
+              AND abs(delta_rel) >= {float(meta["min_effect_rel"])}{effect_abs_clause}, 0) AS is_anomaly
 FROM scored
 """.strip()
 
@@ -155,5 +171,7 @@ FROM scored
 def value_sql(meta: dict, where: str) -> str:
     """The metric on an arbitrary subset — used for the holdout complement. Nothing here
     restates the formula; it is the same `metric_def.sql` under a different WHERE."""
-    return (f"SELECT {meta['sql']} AS value, count() AS sample_count "
-            f"FROM inmobi.ad_events_enriched WHERE {where}")
+    return (
+        f"SELECT {meta['sql']} AS value, count() AS sample_count "
+        f"FROM inmobi.ad_events_enriched WHERE {where}"
+    )

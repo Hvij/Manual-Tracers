@@ -14,6 +14,7 @@ HyperDX alert evaluates on wall clock.
 
 Depends on nothing outside the standard library — replay.sh runs it without a venv.
 """
+
 from __future__ import annotations
 
 import base64
@@ -67,8 +68,11 @@ def query(env: dict[str, str], sql: str) -> list[dict]:
 def get_clock(env: dict[str, str]) -> dict:
     """Not cached: this row is exactly what a compressed replay rewrites, and this script is
     invoked fresh per call, unlike the agent's long-lived process."""
-    rows = query(env, "SELECT bucket_seconds, anchor, origin_dow FROM inmobi.replay_clock "
-                       "FINAL LIMIT 1 FORMAT JSONEachRow")
+    rows = query(
+        env,
+        "SELECT bucket_seconds, anchor, origin_dow FROM inmobi.replay_clock "
+        "FINAL LIMIT 1 FORMAT JSONEachRow",
+    )
     return rows[0] if rows else {"bucket_seconds": 3600, "anchor": 0, "origin_dow": 0}
 
 
@@ -79,8 +83,11 @@ def main() -> int:
     mode, metric_id = sys.argv[1], sys.argv[2]
     env = load_env()
 
-    rows = query(env, f"SELECT * FROM inmobi.metric_def FINAL "
-                       f"WHERE metric_id = '{metric_id}' FORMAT JSONEachRow")
+    rows = query(
+        env,
+        f"SELECT * FROM inmobi.metric_def FINAL "
+        f"WHERE metric_id = '{metric_id}' FORMAT JSONEachRow",
+    )
     if not rows:
         print(f"no such metric_id: {metric_id}", file=sys.stderr)
         return 1
@@ -97,22 +104,35 @@ def main() -> int:
         # above_exclusive at 0 — NOT above, which fires unconditionally at zero.
         # The inner bound is the widest window an alert could ask for; $__timeFilter
         # narrows it to the tile's actual range.
-        inner = metric_sql.deviation_sql(meta, ["ALL"], hist, start, "now()", clock=clock)
-        print(f"SELECT toUInt64(sum(is_anomaly)) AS anomaly_count\nFROM (\n{inner}\n)\n"
-               f"WHERE $__timeFilter(ts)")
+        inner = metric_sql.deviation_sql(
+            meta, ["ALL"], hist, start, "now()", clock=clock
+        )
+        print(
+            f"SELECT toUInt64(sum(is_anomaly)) AS anomaly_count\nFROM (\n{inner}\n)\n"
+            f"WHERE $__timeFilter(ts)"
+        )
     else:
-        dims = [r["dim_id"] for r in query(
-            env, f"SELECT dim_id FROM inmobi.metric_dim_map FINAL "
-                  f"WHERE metric_id = '{metric_id}' AND dim_id NOT IN "
-                  f"(SELECT arrayJoin(invalid_dims) FROM inmobi.metric_def FINAL "
-                  f"WHERE metric_id = '{metric_id}') ORDER BY priority FORMAT JSONEachRow")]
-        inner = metric_sql.deviation_sql(meta, ["ALL"] + dims, hist, start, "now()", clock=clock)
-        print("SELECT dim_name, dim_value, count() AS anomalous_hours,\n"
-               "       round(max(abs(z_score)), 2) AS peak_abs_z,\n"
-               "       round(avg(actual), 4) AS actual, round(avg(expected), 4) AS expected,\n"
-               "       round(sum(abs(delta_abs) * sample_count)) AS contribution\n"
-               f"FROM (\n{inner}\n)\nWHERE is_anomaly = 1\n"
-               "GROUP BY dim_name, dim_value ORDER BY contribution DESC LIMIT 25")
+        dims = [
+            r["dim_id"]
+            for r in query(
+                env,
+                f"SELECT dim_id FROM inmobi.metric_dim_map FINAL "
+                f"WHERE metric_id = '{metric_id}' AND dim_id NOT IN "
+                f"(SELECT arrayJoin(invalid_dims) FROM inmobi.metric_def FINAL "
+                f"WHERE metric_id = '{metric_id}') ORDER BY priority FORMAT JSONEachRow",
+            )
+        ]
+        inner = metric_sql.deviation_sql(
+            meta, ["ALL"] + dims, hist, start, "now()", clock=clock
+        )
+        print(
+            "SELECT dim_name, dim_value, count() AS anomalous_hours,\n"
+            "       round(max(abs(z_score)), 2) AS peak_abs_z,\n"
+            "       round(avg(actual), 4) AS actual, round(avg(expected), 4) AS expected,\n"
+            "       round(sum(abs(delta_abs) * sample_count)) AS contribution\n"
+            f"FROM (\n{inner}\n)\nWHERE is_anomaly = 1\n"
+            "GROUP BY dim_name, dim_value ORDER BY contribution DESC LIMIT 25"
+        )
     return 0
 
 

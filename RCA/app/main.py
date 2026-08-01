@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import math
@@ -11,7 +12,11 @@ from app.narrate import narrate
 from app.registry import get_metric
 from app.report import ledger_to_report
 from app.report_store import persist_report
-from app.schemas import ClickStackAlertPayload, GlobalSeriesRequest, SegmentSeriesRequest
+from app.schemas import (
+    ClickStackAlertPayload,
+    GlobalSeriesRequest,
+    SegmentSeriesRequest,
+)
 from app.utils import TTLCache, sha256_hex
 
 METRIC_ID_RE = re.compile(r"metric_id=(\w+)")
@@ -40,37 +45,61 @@ def _extract(pattern: re.Pattern, payload: ClickStackAlertPayload) -> str | None
     return match.group(1) if match else None
 
 
-def _investigate(metric_id: str, dimension_id: str | None, payload: ClickStackAlertPayload) -> None:
-    ledger = run_investigation(metric_id, dimension_id)
-    result = narrate(ledger)
+async def _investigate(
+    metric_id: str, dimension_id: str | None, payload: ClickStackAlertPayload
+) -> None:
+    ledger = await run_investigation(metric_id, dimension_id)
+    result = await narrate(ledger)
     report = ledger_to_report(ledger, payload, result)
     persist_report(report)
-    logger.info("investigation for %s -> %s", metric_id, json.dumps(report, default=str))
-    tracing.flush()
+    logger.info(
+        "investigation for %s -> %s", metric_id, json.dumps(report, default=str)
+    )
+    # flush() blocks on network I/O until the trace is sent — run it off the event loop so a
+    # slow/retrying export doesn't stall every other request this process is handling.
+    await asyncio.to_thread(tracing.flush)
 
 
 @app.post("/webhooks/alerts", status_code=status.HTTP_202_ACCEPTED)
-async def receive_alert(payload: ClickStackAlertPayload, background_tasks: BackgroundTasks):
+async def receive_alert(
+    payload: ClickStackAlertPayload, background_tasks: BackgroundTasks
+):
     key = sha256_hex(payload.title, payload.body)
     if _dedup.seen(key):
         logger.info("duplicate alert ignored: %s", payload.title)
         return {"status": "duplicate", "delivery_key": key}
 
-    logger.info("alert received: title=%r body=%r link=%r", payload.title, payload.body, payload.link)
+    logger.info(
+        "alert received: title=%r body=%r link=%r",
+        payload.title,
+        payload.body,
+        payload.link,
+    )
 
     metric_id = _extract(METRIC_ID_RE, payload)
     if metric_id is None:
         logger.info("no metric_id found in alert body/title, skipping investigation")
         return {"status": "accepted", "delivery_key": key, "investigation": "skipped"}
 
-    if get_metric(metric_id) is None:
-        logger.warning("metric_id=%r not in metric_def, skipping investigation", metric_id)
-        return {"status": "accepted", "delivery_key": key, "investigation": "unknown_metric"}
+    if await get_metric(metric_id) is None:
+        logger.warning(
+            "metric_id=%r not in metric_def, skipping investigation", metric_id
+        )
+        return {
+            "status": "accepted",
+            "delivery_key": key,
+            "investigation": "unknown_metric",
+        }
 
     dimension_id = _extract(DIMENSION_ID_RE, payload)
     background_tasks.add_task(_investigate, metric_id, dimension_id, payload)
-    return {"status": "accepted", "delivery_key": key, "investigation": "started",
-            "metric_id": metric_id, "dimension_id": dimension_id}
+    return {
+        "status": "accepted",
+        "delivery_key": key,
+        "investigation": "started",
+        "metric_id": metric_id,
+        "dimension_id": dimension_id,
+    }
 
 
 def _json_safe(rows: list[dict]) -> list[dict]:
@@ -79,7 +108,10 @@ def _json_safe(rows: list[dict]) -> list[dict]:
     500s the whole request. NaN/Infinity mean the same thing JSON's null already means here:
     no value to report."""
     return [
-        {k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in row.items()}
+        {
+            k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+            for k, v in row.items()
+        }
         for row in rows
     ]
 
@@ -87,18 +119,22 @@ def _json_safe(rows: list[dict]) -> list[dict]:
 # docs/RCA_UI_TEMPLATE.md Step 3 — rca-api proxies its chart endpoints to these instead of
 # querying ClickHouse itself, so credentials stay in exactly one process (this one).
 @app.post("/internal/global-series")
-def global_series(req: GlobalSeriesRequest):
-    if get_metric(req.metric_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}")
-    return _json_safe(reproduce_global(req.metric_id, req.start, req.end))
+async def global_series(req: GlobalSeriesRequest):
+    if await get_metric(req.metric_id) is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}"
+        )
+    return _json_safe(await reproduce_global(req.metric_id, req.start, req.end))
 
 
 @app.post("/internal/segment-series")
-def segment_series(req: SegmentSeriesRequest):
-    if get_metric(req.metric_id) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}")
+async def segment_series(req: SegmentSeriesRequest):
+    if await get_metric(req.metric_id) is None:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND, f"unknown metric_id: {req.metric_id}"
+        )
     try:
-        rows = reproduce_segment(req.metric_id, req.dim_name, req.start, req.end)
+        rows = await reproduce_segment(req.metric_id, req.dim_name, req.start, req.end)
     except ValueError as e:
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(e))
     if req.dim_values:

@@ -55,7 +55,10 @@ def get_langfuse():
     if _client is None and settings.langfuse_configured:
         from langfuse import Langfuse
 
-        kwargs = {"public_key": settings.langfuse_public_key, "secret_key": settings.langfuse_secret_key}
+        kwargs = {
+            "public_key": settings.langfuse_public_key,
+            "secret_key": settings.langfuse_secret_key,
+        }
         if settings.langfuse_base_url:
             kwargs["base_url"] = settings.langfuse_base_url
         _client = Langfuse(**kwargs)
@@ -76,10 +79,22 @@ def traced(name: str):
 
 def record_query(sql: str, parameters, query_id, read_rows, elapsed_s: float) -> None:
     """Attaches SQL text + query_id + row/elapsed stats to whichever @traced span is
-    currently active — the evidence that ClickHouse, not the LLM, did the work."""
+    currently active — the evidence that ClickHouse, not the LLM, did the work.
+
+    A no-op, quietly, when query_rows() runs outside any @traced(...) function — e.g.
+    get_metric() called directly from a FastAPI handler before the traced investigation
+    functions run. Checking first avoids Langfuse's own update_current_span(): it doesn't
+    raise in that case, it logs a warning directly ('Context error: No active span...'),
+    which our try/except below never sees since nothing was thrown."""
     client = get_langfuse()
     if client is None:
         return
+
+    from opentelemetry import trace as otel_trace_api
+
+    if otel_trace_api.get_current_span() is otel_trace_api.INVALID_SPAN:
+        return
+
     try:
         client.update_current_span(
             metadata={

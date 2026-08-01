@@ -127,7 +127,9 @@ rca-api/server.js
 After `run_investigation()` returns, build the UI object:
 
 ```python
-def ledger_to_report(ledger: dict, alert: ClickStackAlertPayload, narrative: dict) -> dict:
+def ledger_to_report(
+    ledger: dict, alert: ClickStackAlertPayload, narrative: dict
+) -> dict:
     finding = ledger["findings"][0] if ledger.get("findings") else None
     sections = split_narrative(narrative["narrative"])  # 4 paragraphs → 3 section keys
     return {
@@ -273,22 +275,38 @@ What `run_investigation()` produces — the `ledger` field above:
 
 ```python
 {
-  "metric_id": str,
-  "window": {"start": iso, "end": iso},
-  "dimension_id": str | None,
-  "decomposition": dict | None,      # revenue alerts only
-  "findings": [{
-    "factor": str,
-    "global": {"actual", "expected", "hours", "peak_abs_z"},
-    "candidates": [{"dim_name", "dim_value", "avg_actual", "avg_expected",
-                      "peak_abs_z", "contribution"}, ...],
-    "holdout": {"candidate", "residual_actual", "residual_delta",
-                "candidate_delta", "verdict"},
-    "interaction": dict | None,
+    "metric_id": str,
+    "window": {"start": iso, "end": iso},
+    "dimension_id": str | None,
+    "decomposition": dict | None,  # revenue alerts only
+    "findings": [
+        {
+            "factor": str,
+            "global": {"actual", "expected", "hours", "peak_abs_z"},
+            "candidates": [
+                {
+                    "dim_name",
+                    "dim_value",
+                    "avg_actual",
+                    "avg_expected",
+                    "peak_abs_z",
+                    "contribution",
+                },
+                ...,
+            ],
+            "holdout": {
+                "candidate",
+                "residual_actual",
+                "residual_delta",
+                "candidate_delta",
+                "verdict",
+            },
+            "interaction": dict | None,
+            "verdict": str,
+            "ruled_out": [str, ...],
+        }
+    ],
     "verdict": str,
-    "ruled_out": [str, ...]
-  }],
-  "verdict": str
 }
 ```
 
