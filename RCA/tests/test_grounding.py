@@ -17,10 +17,11 @@ LEDGER = {
                  "avg_expected": 0.8089, "peak_abs_z": 6.68, "contribution": 1790.85},
             ],
             "holdout": {
-                "candidate": {"dim_name": "os_version", "dim_value": "Android 15"},
+                "candidate": [{"dim_name": "os_version", "dim_value": "Android 15"}],
                 "residual_actual": 0.7841, "residual_delta": 0.0029,
                 "candidate_delta": -0.3162, "verdict": "localized",
             },
+            "interaction": None,
             "verdict": "localized",
             "ruled_out": ["publisher_tier=tier_2"],
         }
@@ -56,3 +57,27 @@ def test_fallback_summary_needs_no_llm_and_names_the_key_facts():
     assert "fill_rate" in summary
     assert "localized" in summary
     assert "Android 15" in summary
+
+
+def test_fallback_summary_names_both_halves_of_a_crossed_culprit():
+    # depth-1 holdout came back inconclusive, the dependency walk crossed os_version with
+    # device_model, and the pair's holdout confirmed it
+    finding = {
+        **LEDGER["findings"][0],
+        "holdout": {**LEDGER["findings"][0]["holdout"], "verdict": "inconclusive"},
+        "interaction": {
+            "child_dim": "device_model", "strata_tested": 8, "top_share": 0.83,
+            "top": {"child_value": "Galaxy A54", "rate_in": 0.31, "rate_out": 0.78,
+                     "effect": -0.47, "contribution": -3910.5},
+            "verdict": "interaction",
+            "holdout": {
+                "candidate": [{"dim_name": "os_version", "dim_value": "Android 15"},
+                               {"dim_name": "device_model", "dim_value": "Galaxy A54"}],
+                "residual_actual": 0.7802, "residual_delta": -0.0011,
+                "candidate_delta": -0.47, "verdict": "localized",
+            },
+        },
+    }
+    summary = fallback_summary({**LEDGER, "findings": [finding]})
+    assert "os_version=Android 15 AND device_model=Galaxy A54" in summary
+    assert "0.83" in summary

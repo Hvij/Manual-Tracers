@@ -1,15 +1,17 @@
 -- =====================================================================
 -- 03 · SILVER — denormalised, cleaned event stream
 -- =====================================================================
--- Purpose: the RCA drill-down surface and the HyperDX search surface.
---   * NOT the alerting surface (see 04 for the gold rollup).
---   * Every dimension resolved at ingest, so drill-down never joins.
+-- Purpose: THE surface. Every metric, every baseline, every drill-down and
+-- every alert is computed from this table — there is no rollup and no metric
+-- view, because metric_def.sql runs directly against these columns.
+--   * Every dimension resolved at ingest, so nothing downstream joins.
 --   * dictGetOrDefault -> 'unknown' so a dimension key that appears in
 --     the sealed dataset but not in our dim tables degrades gracefully
 --     instead of silently dropping the row.
 --
--- ORDER BY: time first (every query is time-bounded), then the
--- dimensions we most often filter on during a drill-down.
+-- ORDER BY: time first — every query is time-bounded, and both the hourly
+-- bucketing and the baseline lookback scan by event_time — then the dimensions
+-- most often filtered on during a drill-down.
 
 CREATE TABLE IF NOT EXISTS inmobi.ad_events_enriched
 (

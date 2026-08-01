@@ -26,8 +26,8 @@ AD_EVENTS_FILE="InMobi/data/ad_events.parquet"
 #
 # Why WEEKS and not days/hours: shifting by a whole number of weeks keeps
 # day-of-week AND hour-of-day alignment intact, so the seasonal baseline
-# in sql/06_detection.sql stays valid. Shifting by an arbitrary offset
-# would silently corrupt every weekday/weekend comparison.
+# (RCA/app/metric_sql.py, partitioned on hour-of-day and weekday/weekend)
+# stays valid. An arbitrary offset would silently corrupt every comparison.
 #
 # 0 = load timestamps exactly as delivered (correct for offline analysis).
 # Set to the output of scripts/suggest_shift.sh for a live alerting demo.
@@ -113,7 +113,7 @@ ch_sql "SELECT 1" >/dev/null && echo "   connection OK"
 # ------------------------------------------------------------- schema
 if (( DO_SCHEMA )); then
   ch_sql "CREATE DATABASE IF NOT EXISTS ${DB}" >/dev/null
-  for f in 01_schema 02_dictionaries 03_silver 04_gold 05_metric_layer 06_detection; do
+  for f in 01_schema 02_dictionaries 03_silver 04_semantic_layer; do
     apply_sql_file "${SQL_DIR}/${f}.sql"
   done
 fi
@@ -138,7 +138,7 @@ fi
 # --------------------------------------------------------------- data
 if (( DO_DATA )); then
   log "replaying ${AD_EVENTS_FILE}"
-  echo "   MVs will populate ad_events_enriched and metric_1h on insert"
+  echo "   MV1 will populate ad_events_enriched on insert"
   START=$(date +%s)
 
   if [[ "$TIME_SHIFT_WEEKS" -eq 0 ]]; then
@@ -167,7 +167,6 @@ log "row counts"
 ch_sql "
 SELECT 'ad_events' AS layer, count() AS rows, toString(min(event_time)) AS from_ts, toString(max(event_time)) AS to_ts FROM ${DB}.ad_events
 UNION ALL SELECT 'ad_events_enriched', count(), toString(min(event_time)), toString(max(event_time)) FROM ${DB}.ad_events_enriched
-UNION ALL SELECT 'metric_1h',          count(), toString(min(ts)),         toString(max(ts))         FROM ${DB}.metric_1h
 FORMAT PrettyCompactMonoBlock"
 
 log "enrichment health (want 0 unknowns)"
@@ -180,21 +179,14 @@ SELECT
 FROM ${DB}.ad_events_enriched
 FORMAT PrettyCompactMonoBlock"
 
-log "top incidents detected"
-ch_sql "
-SELECT toDate(ts) AS day, metric_id, dim_name, dim_value, direction,
-       countIf(is_anomaly) AS anomalous_hours,
-       round(avgIf(actual, is_anomaly),4) AS actual,
-       round(avgIf(expected, is_anomaly),4) AS expected,
-       round(avgIf(delta_rel, is_anomaly)*100,2) AS delta_pct,
-       round(maxIf(abs(z_score), is_anomaly),2) AS peak_abs_z,
-       max(severity) AS severity
-FROM ${DB}.v_metric_deviation
-GROUP BY day, metric_id, dim_name, dim_value, direction
-HAVING anomalous_hours >= 3
-ORDER BY peak_abs_z DESC
-LIMIT 25
-FORMAT PrettyCompactMonoBlock"
+# Deviation is not a stored view — it is rendered from metric_def by the same
+# builder the RCA agent uses, so this check exercises the real detection path
+# rather than a parallel copy of the maths.
+for m in fill_rate requests ecpm revenue; do
+  log "top segments for ${m} (live deviation scan)"
+  SCAN=$(python3 scripts/metric_query.py scan "$m") || die "could not render scan for ${m}"
+  ch_sql "${SCAN} FORMAT PrettyCompactMonoBlock"
+done
 
 log "done"
 
@@ -204,5 +196,4 @@ log "done"
 #
 #   TRUNCATE TABLE inmobi.ad_events;
 #   TRUNCATE TABLE inmobi.ad_events_enriched;
-#   TRUNCATE TABLE inmobi.metric_1h;
 # =====================================================================

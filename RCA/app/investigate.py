@@ -2,34 +2,43 @@ import math
 from datetime import timedelta
 from statistics import mean
 
+from app import metric_sql
 from app.clickhouse_client import query_rows
-from app.registry import get_dim_priority, get_metric
+from app.registry import get_dim_deps, get_dim_map, get_metric, known_dims
 from app.tracing import traced
-
-REVENUE_IDENTITY_FACTORS = ["requests", "fill_rate", "render_rate", "ecpm"]
 
 # guard against dividing by a near-zero total log-move when identity factors offset each
 # other (e.g. fill_rate down, ecpm up, net revenue roughly flat) — see
 # docs/RCA_DECOMPOSITION_MATH.md §2.4 "degenerate-G guard rail"
 EPSILON_G = 0.005
 
-# raw ad_events_enriched expression for each metric_registry numerator/denominator name
-RAW_EXPR = {
-    "fills": "sum(is_filled)",
-    "requests": "count()",
-    "impressions": "sum(is_impression)",
-    "clicks": "sum(is_click)",
-    "revenue": "sum(revenue)",
-}
-
-# not derived from the alert body (only metric_id is), but validated anyway before
-# splicing into SQL since dim_name becomes a raw column reference, not a bound parameter
-DIMENSION_COLUMNS = {
-    "ad_format", "category", "publisher_tier", "region",
-    "country", "device_model", "os_version", "vertical", "campaign_type",
-}
-
 HOLDOUT_RATIO_THRESHOLD = 0.25
+
+# Share of the parent cut's gross stratum effect that one stratum must carry before the
+# culprit is called an interaction rather than the parent alone.
+# ponytail: a top-share cut, not a formal interaction test — upgrade path is per-stratum
+# significance (proportionsZTest inside vs outside) if the share proves too blunt.
+CROSS_SHARE_THRESHOLD = 0.6
+
+
+def _dim_col(dim_name: str) -> str:
+    """dim_name becomes a raw column reference, not a bound parameter, so it is whitelisted
+    against the registry first. Reachable from the alert body now that dimension_id is
+    accepted, which makes this a trust boundary, not a formality."""
+    if dim_name not in known_dims():
+        raise ValueError(f"unknown dimension column {dim_name!r}")
+    return dim_name
+
+
+def _window_params(start, end) -> dict:
+    """The baseline needs history the investigation window itself does not cover."""
+    return {"hist_start": end - timedelta(weeks=metric_sql.HISTORY_WEEKS),
+             "start": start, "end": end}
+
+
+def _deviation(meta: dict, dims: list[str]) -> str:
+    return metric_sql.deviation_sql(meta, dims, hist_start="{hist_start:DateTime}",
+                                     start="{start:DateTime}", end="{end:DateTime}")
 
 
 def get_max_ts():
@@ -39,12 +48,13 @@ def get_max_ts():
 
 @traced("reproduce_global")
 def reproduce_global(metric_id: str, start, end) -> list[dict]:
+    """The global hourly series, scored. Computed live from silver — there is no stored
+    deviation series to trust, and nothing on the alert wire is taken as proof."""
+    meta = get_metric(metric_id)
     return query_rows(
         "SELECT ts, actual, expected, z_score, delta_rel, is_anomaly "
-        "FROM inmobi.v_metric_deviation "
-        "WHERE metric_id = {metric_id:String} AND dim_name = 'ALL' "
-        "AND ts > {start:DateTime} AND ts <= {end:DateTime} ORDER BY ts",
-        {"metric_id": metric_id, "start": start, "end": end},
+        f"FROM ({_deviation(meta, ['ALL'])}) ORDER BY ts",
+        _window_params(start, end),
     )
 
 
@@ -93,22 +103,25 @@ def compute_factor_contributions(growth: dict[str, float], total_delta_rel: floa
 
 
 @traced("decompose")
-def decompose(anomalous_rows: list[dict], start, end) -> dict:
-    """Walk the revenue identity before touching any dimension (CLAUDE.md rule 5). Every
-    factor gets a verdict — not just the loudest one — per CLAUDE.md rule 6."""
+def decompose(metric_id: str, anomalous_rows: list[dict], start, end) -> dict:
+    """Walk the funnel identity before touching any dimension (CLAUDE.md rule 5). The factor
+    list is metric_def.dependencies, in funnel order — not a Python constant — so the
+    identity is part of the metric definition and travels with it. Every factor gets a
+    verdict, not just the loudest one, per CLAUDE.md rule 6."""
+    factor_ids = list(get_metric(metric_id)["dependencies"])
     total_actual, total_expected = _mean_actual_expected(anomalous_rows)
     total_delta_rel = (total_actual - total_expected) / total_expected
     anomalous_ts = {r["ts"] for r in anomalous_rows}
 
     factor_rows = {}
     growth = {}
-    for factor in REVENUE_IDENTITY_FACTORS:
+    for factor in factor_ids:
         rows = [r for r in reproduce_global(factor, start, end) if r["ts"] in anomalous_ts]
         factor_rows[factor] = rows
         means = _mean_actual_expected(rows)
         growth[factor] = _log_growth(*means) if means else 0.0
 
-    min_effect_rel = {f: get_metric(f)["min_effect_rel"] for f in REVENUE_IDENTITY_FACTORS}
+    min_effect_rel = {f: get_metric(f)["min_effect_rel"] for f in factor_ids}
     result = compute_factor_contributions(growth, total_delta_rel, min_effect_rel)
 
     for entry in result["factors"]:
@@ -119,22 +132,33 @@ def decompose(anomalous_rows: list[dict], start, end) -> dict:
 
 
 @traced("scan_dims")
-def scan_dims(metric_id: str, start, end) -> list[dict]:
+def scan_dims(metric_id: str, start, end, first_dim: str | None = None) -> list[dict]:
     meta = get_metric(metric_id)
     invalid = set(meta["invalid_dims"] or [])
-    eligible = [r["dim_name"] for r in get_dim_priority(metric_id) if r["dim_name"] not in invalid]
+    eligible = [r["dim_id"] for r in get_dim_map(metric_id)
+                if r["dim_id"] not in invalid and r["dim_id"] in known_dims()]
     if not eligible:
         return []
+    # a dimension_id on the alert is a hint about where to look, never evidence: it only
+    # narrows the first scan, and an empty result falls straight back to the full sweep.
+    if first_dim in eligible:
+        return _scan(metric_id, [first_dim], start, end) or _scan(metric_id, eligible, start, end)
+    return _scan(metric_id, eligible, start, end)
+
+
+def _scan(metric_id: str, dims: list[str], start, end) -> list[dict]:
+    """One scan covers every candidate dimension: the fan-out is an ARRAY JOIN inside the
+    deviation query, so 62 depth-1 slices cost one pass over silver, not 62.
+    Ranked by contribution — Σ |delta_abs| × sample_count — never by percentage change."""
+    meta = get_metric(metric_id)
     return query_rows(
         "SELECT dim_name, dim_value, count() AS anomalous_hours, "
         "max(abs(z_score)) AS peak_abs_z, avg(actual) AS avg_actual, "
         "avg(expected) AS avg_expected, avg(delta_rel) AS avg_delta_rel, "
         "sum(abs(delta_abs) * sample_count) AS contribution "
-        "FROM inmobi.v_metric_deviation "
-        "WHERE metric_id = {metric_id:String} AND dim_name IN {dims:Array(String)} "
-        "AND ts > {start:DateTime} AND ts <= {end:DateTime} AND is_anomaly = 1 "
+        f"FROM ({_deviation(meta, dims)}) WHERE is_anomaly = 1 "
         "GROUP BY dim_name, dim_value ORDER BY contribution DESC",
-        {"metric_id": metric_id, "dims": eligible, "start": start, "end": end},
+        _window_params(start, end),
     )
 
 
@@ -148,61 +172,155 @@ def compute_holdout_verdict(candidate_delta: float, residual_delta: float,
 
 
 @traced("holdout_check")
-def holdout_check(metric_id: str, candidate: dict, global_expected_ref: float, start, end) -> dict:
-    dim_col = candidate["dim_name"]
-    if dim_col not in DIMENSION_COLUMNS:
-        raise ValueError(f"refusing to holdout-check unknown dimension column {dim_col!r}")
-
+def holdout_check(metric_id: str, conditions: list[dict], candidate_delta: float,
+                   global_expected_ref: float, start, end) -> dict:
+    """Recompute the metric on the COMPLEMENT of the candidate. `conditions` is ANDed, so a
+    single entry holds out one depth-1 slice and two entries hold out a crossed pair —
+    neither is a stored series, which is why this has to hit silver directly."""
     meta = get_metric(metric_id)
-    num_expr = RAW_EXPR[meta["numerator"]]
-    den_expr = RAW_EXPR[meta["denominator"]] if meta["denominator"] else "1"
 
-    rows = query_rows(
-        f"SELECT {num_expr} AS num, {den_expr} AS den FROM inmobi.ad_events_enriched "
-        f"WHERE event_time > {{start:DateTime}} AND event_time <= {{end:DateTime}} "
-        f"AND {dim_col} != {{dim_val:String}}",
-        {"start": start, "end": end, "dim_val": candidate["dim_value"]},
-    )
-    num, den = rows[0]["num"], rows[0]["den"]
-    residual_actual = (num / den * meta["scale"]) if meta["is_ratio"] else num * meta["scale"]
+    clauses, params = [], {"start": start, "end": end}
+    for i, c in enumerate(conditions):
+        clauses.append(f"{_dim_col(c['dim_name'])} = {{dim_val_{i}:String}}")
+        params[f"dim_val_{i}"] = c["dim_value"]
 
+    where = ("event_time > {start:DateTime} AND event_time <= {end:DateTime} "
+              f"AND NOT ({' AND '.join(clauses)})")
+    rows = query_rows(metric_sql.value_sql(meta, where), params)
+    residual_actual = rows[0]["value"]
     residual_delta = residual_actual - global_expected_ref
-    candidate_delta = candidate["avg_actual"] - candidate["avg_expected"]
-    verdict = compute_holdout_verdict(candidate_delta, residual_delta)
 
     return {
-        "candidate": {"dim_name": dim_col, "dim_value": candidate["dim_value"]},
+        "candidate": [{"dim_name": c["dim_name"], "dim_value": c["dim_value"]} for c in conditions],
         "residual_actual": residual_actual,
         "residual_delta": residual_delta,
         "candidate_delta": candidate_delta,
-        "verdict": verdict,
+        "verdict": compute_holdout_verdict(candidate_delta, residual_delta),
     }
 
 
+def compute_interaction(child_dim: str, rows: list[dict],
+                         share_threshold: float = CROSS_SHARE_THRESHOLD) -> dict | None:
+    """Stratified inside-vs-outside comparison: for every value of the child dimension, how
+    much worse is the parent slice than the rest of the population in that same stratum?
+
+        effect_v       = metric(parent AND child=v) - metric(NOT parent AND child=v)
+        contribution_v = effect_v * sample_count(parent AND child=v)
+
+    The rest of the population is the control, so no depth-2 baseline is needed — and none
+    exists, since nothing is pre-aggregated. If the parent's fault is genuinely at the
+    parent's level the effect is spread across strata; if one stratum carries it, the
+    culprit is the pair. Returns None when there is nothing to compare."""
+    inside, outside = {}, {}
+    for r in rows:
+        (inside if r["in_parent"] else outside)[r["child_value"]] = r
+
+    strata = []
+    for value, row in inside.items():
+        control = outside.get(value)
+        if row["value"] is None or control is None or control["value"] is None:
+            continue
+        rate_in, rate_out = row["value"], control["value"]
+        effect = rate_in - rate_out
+        strata.append({"child_value": value, "rate_in": rate_in, "rate_out": rate_out,
+                       "effect": effect, "contribution": effect * row["sample_count"]})
+
+    if len(strata) < 2:
+        return None
+    # gross (sum of absolute) rather than net: strata pulling in opposite directions must not
+    # shrink the denominator and manufacture a fake concentration.
+    gross = sum(abs(s["contribution"]) for s in strata)
+    if gross == 0:
+        return None
+
+    top = max(strata, key=lambda s: abs(s["contribution"]))
+    share = abs(top["contribution"]) / gross
+    return {"child_dim": child_dim, "strata_tested": len(strata), "top": top,
+             "top_share": share, "verdict": "interaction" if share >= share_threshold else "uniform"}
+
+
+@traced("scan_interaction")
+def scan_interaction(metric_id: str, parent: dict, child_dim: str, start, end) -> dict | None:
+    meta = get_metric(metric_id)
+    parent_col, child_col = _dim_col(parent["dim_name"]), _dim_col(child_dim)
+
+    rows = query_rows(
+        f"SELECT {child_col} AS child_value, {parent_col} = {{parent_val:String}} AS in_parent, "
+        f"{meta['sql']} AS value, count() AS sample_count FROM inmobi.ad_events_enriched "
+        "WHERE event_time > {start:DateTime} AND event_time <= {end:DateTime} "
+        "GROUP BY child_value, in_parent",
+        {"parent_val": parent["dim_value"], "start": start, "end": end},
+    )
+    return compute_interaction(child_dim, rows)
+
+
+@traced("cross_check")
+def cross_check(metric_id: str, parent: dict, global_expected_ref: float, start, end) -> dict:
+    """Step 5 of the ladder: walk metric_dim_map.dependencies for the cut just made — the
+    tree, one level down. Stops at the first dependent dimension that concentrates, since
+    the dependency array is priority-ordered."""
+    meta = get_metric(metric_id)
+    if not meta["is_ratio"]:
+        # An inside-vs-outside comparison needs a rate. A count inside the parent slice has
+        # no comparable outside value, so depth-2 on an additive metric would need a
+        # depth-2 seasonal baseline, which nothing here stores.
+        # ponytail: skip with a stated reason rather than invent a comparison.
+        return {"skipped": "additive_metric_needs_depth2_baseline"}
+
+    invalid = set(meta["invalid_dims"] or [])
+    for child_dim in get_dim_deps(metric_id, parent["dim_name"]):
+        if child_dim in invalid or child_dim == parent["dim_name"] or child_dim not in known_dims():
+            continue
+        interaction = scan_interaction(metric_id, parent, child_dim, start, end)
+        if interaction and interaction["verdict"] == "interaction":
+            top = interaction["top"]
+            interaction["holdout"] = holdout_check(
+                metric_id,
+                [parent, {"dim_name": child_dim, "dim_value": top["child_value"]}],
+                top["effect"], global_expected_ref, start, end,
+            )
+            return interaction
+    return {"skipped": "no_dependent_dimension_concentrated"}
+
+
 @traced("investigate_factor")
-def _investigate_factor(target_metric: str, global_summary: dict, start, end) -> dict:
-    candidates = scan_dims(target_metric, start, end)
+def _investigate_factor(target_metric: str, global_summary: dict, start, end,
+                         first_dim: str | None = None) -> dict:
+    candidates = scan_dims(target_metric, start, end, first_dim)
     if not candidates:
         return {"factor": target_metric, "global": global_summary, "verdict": "broad_based",
                  "candidates": [], "ruled_out": []}
 
-    holdout = holdout_check(target_metric, candidates[0], global_summary["expected"], start, end)
-    ruled_out = (
-        [f"{c['dim_name']}={c['dim_value']}" for c in candidates[1:]]
-        if holdout["verdict"] == "localized" else []
-    )
+    top = candidates[0]
+    parent = {"dim_name": top["dim_name"], "dim_value": top["dim_value"]}
+    holdout = holdout_check(target_metric, [parent], top["avg_actual"] - top["avg_expected"],
+                             global_summary["expected"], start, end)
+
+    # The dependency walk always runs after a cut is made — that is what metric_dim_map's
+    # dependencies are for. It can only ever narrow the answer: the pair replaces the single
+    # cut when one stratum carries the parent's move AND the pair's own holdout confirms it.
+    interaction = cross_check(target_metric, parent, global_summary["expected"], start, end)
+    verdict = holdout["verdict"]
+    if interaction.get("holdout", {}).get("verdict") == "localized":
+        verdict = "localized"
+
     return {
         "factor": target_metric,
         "global": global_summary,
         "candidates": candidates[:10],
         "holdout": holdout,
-        "verdict": holdout["verdict"],
-        "ruled_out": ruled_out,
+        "interaction": interaction,
+        "verdict": verdict,
+        "ruled_out": (
+            [f"{c['dim_name']}={c['dim_value']}" for c in candidates[1:]]
+            if verdict == "localized" else []
+        ),
     }
 
 
 @traced("run_investigation")
-def run_investigation(metric_id: str, lookback_hours: int = 24) -> dict:
+def run_investigation(metric_id: str, dimension_id: str | None = None,
+                       lookback_hours: int = 24) -> dict:
     meta = get_metric(metric_id)
     if meta is None:
         return {"metric_id": metric_id, "verdict": "unknown_metric"}
@@ -211,20 +329,24 @@ def run_investigation(metric_id: str, lookback_hours: int = 24) -> dict:
     start, end = max_ts - timedelta(hours=lookback_hours), max_ts
     window = {"start": start.isoformat(), "end": end.isoformat()}
 
+    # dimension_id from the alert is only ever a scan-priority hint (see scan_dims). The
+    # global series is what has to reproduce, and it is recomputed here, not read back.
     anomalous = _anomalous(reproduce_global(metric_id, start, end))
     if not anomalous:
         return {"metric_id": metric_id, "window": window, "verdict": "not_reproducible"}
 
     decomposition = None
-    if meta["level"] == 1:
-        decomposition = decompose(anomalous, start, end)
+    if meta["dependencies"]:
+        decomposition = decompose(metric_id, anomalous, start, end)
         implicated = [f for f in decomposition["factors"] if f["verdict"] == "implicated"]
         if not implicated:
             return {"metric_id": metric_id, "window": window, "decomposition": decomposition,
                      "verdict": "not_reproducible"}
-        findings = [_investigate_factor(f["metric_id"], f["global"], start, end) for f in implicated]
+        findings = [_investigate_factor(f["metric_id"], f["global"], start, end, dimension_id)
+                     for f in implicated]
     else:
-        findings = [_investigate_factor(metric_id, _global_summary(anomalous), start, end)]
+        findings = [_investigate_factor(metric_id, _global_summary(anomalous), start, end,
+                                         dimension_id)]
 
     verdicts = {f["verdict"] for f in findings}
     overall_verdict = (
@@ -236,6 +358,7 @@ def run_investigation(metric_id: str, lookback_hours: int = 24) -> dict:
     return {
         "metric_id": metric_id,
         "window": window,
+        "dimension_id": dimension_id,
         "decomposition": decomposition,
         "findings": findings,
         "verdict": overall_verdict,

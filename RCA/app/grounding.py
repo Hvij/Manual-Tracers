@@ -1,4 +1,4 @@
-"""Mechanical grounding for the narrator (docs/RCA_OUTPUT_CONTRACT.md §2 narration rules):
+"""Mechanical grounding for the narrator (architecture.md §4, narration rules):
 every number the LLM writes must already exist in the ledger, at some rounding, or the
 narrative is discarded in favor of a plain summary built straight from the ledger."""
 
@@ -34,10 +34,26 @@ def fallback_summary(ledger: dict) -> str:
         )
         holdout = finding.get("holdout")
         if holdout:
-            c = holdout["candidate"]
-            lines.append(f"    top candidate: {c['dim_name']}={c['dim_value']} (holdout: {holdout['verdict']})")
+            lines.append(f"    top candidate: {_slice_name(holdout['candidate'])} "
+                          f"(holdout: {holdout['verdict']})")
+        interaction = finding.get("interaction") or {}
+        if interaction.get("top"):
+            lines.append(
+                f"    crossed with {interaction['child_dim']}={interaction['top']['child_value']}: "
+                f"top_share={interaction['top_share']:.2f} of {interaction['strata_tested']} strata, "
+                f"{interaction['verdict']}"
+            )
+            crossed = interaction.get("holdout")
+            if crossed:
+                lines.append(f"    crossed candidate: {_slice_name(crossed['candidate'])} "
+                              f"(holdout: {crossed['verdict']})")
 
     return "\n".join(lines)
+
+
+def _slice_name(conditions: list[dict]) -> str:
+    """holdout candidates are a list of ANDed conditions — one entry at depth 1, two crossed."""
+    return " AND ".join(f"{c['dim_name']}={c['dim_value']}" for c in conditions)
 
 
 def allowed_numbers(ledger: dict) -> set[str]:

@@ -16,10 +16,7 @@ elegant, but never trade away correctness or traceability, which are what is sco
 | `InMobi/metrics_glossary.md` | **Authoritative** metric formulas — never restate them elsewhere |
 | `architecture.md` | System design and the reasoning behind it |
 | `docs/RCA_AGENT_DESIGN.md` | **As-built.** What actually runs today (`RCA/app/`), vs. what's still to build |
-| `docs/RCA_OUTPUT_CONTRACT.md` | The ledger, the narrative, the trace, the webhook payload (target shape; §4 matches reality) |
-| `docs/RCA_DECOMPOSITION_MATH.md` | Design spec (not yet built): multi-factor revenue decomposition math + corrected pipeline diagram |
-| `docs/WORK_HARSH_DATA.md` | Harsh's queue |
-| `docs/WORK_ML_AGENT.md` | Partner's queue |
+| `docs/RCA_DECOMPOSITION_MATH.md` | Derivation of the log-share revenue decomposition |
 
 ## Hard constraints
 
@@ -38,45 +35,60 @@ elegant, but never trade away correctness or traceability, which are what is sco
 ## Layers
 
 ```
-ad_events                bronze · raw, replayed, the only table reloaded
-  ├─ MV1 ─▶ ad_events_enriched   silver · dictGet-denormalised · RCA drill surface
-  └─ MV2 ─▶ metric_1h            gold   · hourly marginals · ALERT surface (~53K rows)
-                 ├─ v_metric_points     THE metric layer — formulas live only here
-                 ├─ v_metric_baseline   seasonal baseline
-                 └─ v_metric_deviation  scored + guard-railed
-                        │  ClickStack tile alert (is_anomaly count, metric_id in message)
-                        ▼
-                   webhook ─▶ RCA agent (RCA/app/) ─▶ [narrator + trace, not yet built]
+ad_events                       raw, replayed, the only table loaded
+  └─ MV1 ─▶ ad_events_enriched  dictGet-denormalised · event_time indexed
+                                EVERYTHING reads this: metrics, baselines, drill-downs
+
+metric_def                      metric_id · sql · dependencies · z_score_threshold + guard rails
+metric_dim_map                  (metric_id, dim_id) · priority · dependencies
+       │
+       ▼  RCA/app/metric_sql.py renders one query: series → baseline → z → is_anomaly
+   HyperDX chart + alert (above_exclusive 0, static metric_id in the message)
+       │
+       ▼
+   webhook ─▶ RCA agent (RCA/app/) ─▶ narrator + grounding ─▶ Langfuse trace
 ```
 
-Files: `sql/01_schema` → `02_dictionaries` → `03_silver` → `04_gold` →
-`05_metric_layer` → `06_detection`. Apply in order; `scripts/replay.sh` does it.
-`06_detection.sql` ends at `v_metric_deviation` — there is no persisted
-incident table; the RCA agent re-derives everything live per alert (see
-`docs/RCA_AGENT_DESIGN.md` §3.3 for what was removed and why).
+**No metric views, no rollup, no incident table.** `metric_def.sql` executes
+directly against `ad_events_enriched`. The detection maths exists in exactly one
+place — `RCA/app/metric_sql.py` — rendered twice: with bound parameters by the
+agent, with `now()`-relative bounds by `scripts/metric_query.py` for HyperDX.
+Do not reintroduce a view or a materialised rollup without moving the builder
+behind it; two copies of a formula is the failure this design exists to avoid.
 
-The RCA agent itself (webhook receiver + investigation ladder) is its own `uv`
-project in `RCA/` — `RCA/app/main.py` (webhook), `RCA/app/investigate.py`
-(reproduce → decompose → scan → holdout), `RCA/app/registry.py`
-(`metric_registry` / `metric_dim_priority` lookups).
+Files: `sql/01_schema` → `02_dictionaries` → `03_silver` → `04_semantic_layer`.
+Apply in order; `scripts/replay.sh` does it.
+
+The RCA agent is its own `uv` project in `RCA/` — `main.py` (webhook),
+`investigate.py` (reproduce → decompose → scan → holdout → dependency walk),
+`metric_sql.py` (the query builder), `registry.py` (`metric_def` /
+`metric_dim_map` lookups).
+
+`scripts/metric_query.py alert <metric>` prints the HyperDX chart SQL;
+`scripts/metric_query.py scan <metric>` prints the ranked segment scan
+(`replay.sh` runs it as its post-load verification).
 
 ## Non-negotiable design rules
 
-1. **Alert on marginals, drill on combinations.** The full dimension cross-product
-   is 767,984 combos (measured). `metric_1h` stores one row per
-   `(hour, dim_name, dim_value)` — 63 series/hour.
-2. **Alerting cardinality budget:** only dimensions with ≤ ~50 distinct values are
-   alert series. `app_id` (2,000), `geo_device_id` (5,000), `advertiser_id` (500)
-   are drill-down targets, never alert series.
-3. **Ratios are sum/sum, always.** Never average a ratio. `metric_1h` stores only
-   additive base quantities so this is structurally enforced.
+1. **Alert on the global series, enumerate marginals at drill time, never the
+   cross-product.** That cross-product is 767,984 combos (measured). Alerts read
+   `dim_name = 'ALL'`; depth 1 fans 62 marginal slices out with one `ARRAY JOIN`
+   in a single pass; depth 2 crosses only what `metric_dim_map.dependencies` says
+   is entangled with the cut that led.
+2. **Cardinality budget:** a dimension is a candidate only if it has a row in
+   `metric_dim_map`, and only dimensions with ≤ ~50 distinct values get one.
+   `app_id` (2,000), `geo_device_id` (5,000), `advertiser_id` (500) are absent by
+   design — reachable for a manual drill, never enumerated.
+3. **Ratios are sum/sum, always.** Never average a ratio. `metric_def.sql` is a
+   single aggregate expression over raw rows, so this is structurally enforced.
 4. **`min_samples` guards degenerate slices — it is not a confidence knob.**
    `proportionsZTest` supplies confidence. At 5,000 it silently hid the largest
    planted incident (Android 15, ~1,025 req/hr). To cut noise, tighten `z` or the
    effect-size floors instead.
-5. **Metric levelling.** L1 `revenue` decomposes through the identity
-   (`Requests × Fill rate × Render rate × eCPM/1000`) *before* any dimension is
-   sliced. Otherwise one fault reports as three independent incidents.
+5. **Decompose before slicing.** A metric with `metric_def.dependencies`
+   (`revenue`) walks the identity `Requests × Fill rate × Render rate × eCPM/1000`
+   *before* any dimension is cut. Otherwise one fault reports as three
+   independent incidents.
 6. **You can only rule out what you enumerated.** Every candidate gets a verdict:
    `implicated | cleared | inconclusive`. The ledger is simultaneously the LLM's
    input and the Langfuse trace.
@@ -94,7 +106,10 @@ project in `RCA/` — `RCA/app/main.py` (webhook), `RCA/app/investigate.py`
   InMobi/data/` before committing from the sandbox.** (This already happened once
   and was repaired in commit `6a9c7a4`.)
 - **The sandbox cannot reach ClickHouse Cloud** (proxy 403). Validate SQL by running
-  it as a SELECT through the ClickStack MCP; execute DDL locally.
+  it as a SELECT through the ClickStack MCP; execute DDL locally. A rendered
+  deviation query can be smoke-tested with no tables at all by swapping
+  `inmobi.ad_events_enriched` for a `numbers()` subquery that fabricates the
+  columns — that validates the whole CTE/window/z-test shape.
 - Pushing needs Harsh's SSH key — the sandbox has none.
 - **`curl --data-binary @path` can fail to open large files in some sandboxed
   shells** (`curl: option --data-binary: error encountered when reading a file`,
@@ -119,7 +134,7 @@ project in `RCA/` — `RCA/app/main.py` (webhook), `RCA/app/investigate.py`
 - `vertical` / `campaign_type` exist only on filled requests, so `fill_rate` is
   meaningless for them (`invalid_dims` in the registry).
 
-## Confirmed detections (~2s over 9M rows)
+## Confirmed detections (9M rows — measured before the rebuild, re-confirm after ingest)
 
 | Day(s) | Segment | Actual | Expected | Peak z |
 |---|---|---|---|---|
@@ -153,10 +168,15 @@ project in `RCA/` — `RCA/app/main.py` (webhook), `RCA/app/investigate.py`
 
 ```bash
 ./scripts/replay.sh --schema    # DDL only
-./scripts/replay.sh             # DDL + replay AD_EVENTS_FILE through the MVs
+./scripts/replay.sh             # DDL + replay AD_EVENTS_FILE through MV1
 ./scripts/replay.sh --data      # replay only
 ./scripts/replay.sh --dims      # also reload the dimension CSVs
 ./scripts/suggest_shift.sh      # compute TIME_SHIFT_WEEKS
+
+./scripts/metric_query.py alert fill_rate   # SQL to paste into a HyperDX chart
+./scripts/metric_query.py scan  fill_rate   # ranked segment scan (replay.sh uses this)
+
+cd RCA && uv run pytest -q                  # 39 tests, no ClickHouse needed
 ```
 
 Sealed dataset: change `AD_EVENTS_FILE` at the top of `replay.sh`, truncate manually

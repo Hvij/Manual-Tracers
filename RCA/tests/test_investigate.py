@@ -2,7 +2,17 @@ import math
 
 import pytest
 
-from app.investigate import compute_factor_contributions, compute_holdout_verdict, _log_growth
+from app.investigate import (
+    compute_factor_contributions,
+    compute_holdout_verdict,
+    compute_interaction,
+    _log_growth,
+)
+
+def _strata(rows):
+    """rows: (child_value, in_parent, value, sample_count) — scan_interaction's row shape."""
+    return [{"child_value": v, "in_parent": p, "value": val, "sample_count": n}
+            for v, p, val, n in rows]
 
 
 def test_localized_when_residual_near_zero():
@@ -56,6 +66,52 @@ def test_two_factors_can_both_be_implicated():
     verdicts = {f["metric_id"]: f["verdict"] for f in result["factors"]}
     assert verdicts["fill_rate"] == "implicated"
     assert verdicts["ecpm"] == "implicated"
+
+
+def test_interaction_found_when_one_stratum_carries_the_parent_effect():
+    # parent = os_version 'Android 15', crossed with device_model: only Galaxy A54 inside the
+    # parent slice is depressed against the same device outside it -> the culprit is the pair
+    rows = _strata([
+        ("Galaxy A54", 1, 0.300, 1000), ("Galaxy A54", 0, 0.780, 1000),
+        ("Pixel 8",    1, 0.770, 1000), ("Pixel 8",    0, 0.780, 1000),
+        ("iPhone 15",  1, 0.775, 1000), ("iPhone 15",  0, 0.780, 1000),
+    ])
+    result = compute_interaction("device_model", rows)
+
+    assert result["verdict"] == "interaction"
+    assert result["top"]["child_value"] == "Galaxy A54"
+    assert result["strata_tested"] == 3
+    assert result["top_share"] > 0.9
+
+
+def test_uniform_when_the_parent_effect_is_spread_across_strata():
+    # every device inside the parent slice is equally depressed -> the fault is at the
+    # parent's level, and naming a device would be bleed-through
+    rows = _strata([
+        ("Galaxy A54", 1, 0.50, 1000), ("Galaxy A54", 0, 0.78, 1000),
+        ("Pixel 8",    1, 0.50, 1000), ("Pixel 8",    0, 0.78, 1000),
+        ("iPhone 15",  1, 0.50, 1000), ("iPhone 15",  0, 0.78, 1000),
+    ])
+    assert compute_interaction("device_model", rows)["verdict"] == "uniform"
+
+
+def test_opposite_signed_strata_do_not_manufacture_a_concentration():
+    # one stratum up, one down by the same amount: the NET effect is zero, so a net
+    # denominator would divide by ~0 and report a fake dominant child. Gross must be used.
+    rows = _strata([
+        ("Galaxy A54", 1, 0.90, 1000), ("Galaxy A54", 0, 0.78, 1000),
+        ("Pixel 8",    1, 0.66, 1000), ("Pixel 8",    0, 0.78, 1000),
+    ])
+    result = compute_interaction("device_model", rows)
+
+    assert result["verdict"] == "uniform"
+    assert result["top_share"] == pytest.approx(0.5)
+
+
+def test_no_interaction_without_a_control_for_the_stratum():
+    # child value exists only inside the parent slice — nothing to compare it against
+    rows = _strata([("Galaxy A54", 1, 0.30, 1000), ("Pixel 8", 0, 0.78, 1000)])
+    assert compute_interaction("device_model", rows) is None
 
 
 def test_offsetting_factors_skip_the_share_split():

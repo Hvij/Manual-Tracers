@@ -18,7 +18,7 @@ An alert says *that* a metric moved. This system answers *why*, with every numbe
 computed in ClickHouse and none invented by a language model.
 
 ```
-ClickStack tile alert (v_metric_deviation, metric_id in message)
+ClickStack chart alert (rendered from metric_def, metric_id in message)
    → POST /webhooks/alerts (RCA/app/main.py)
    → run_investigation(metric_id)  — RCA/app/investigate.py
         reproduce → decompose (revenue only) → scan_dims → holdout_check
@@ -29,7 +29,7 @@ ClickStack tile alert (v_metric_deviation, metric_id in message)
 | Requirement | How this meets it |
 |---|---|
 | Every figure reproducible | The agent recomputes everything against live ClickHouse; the alert body carries only `metric_id`, never a value. |
-| Drill-down lives in ClickHouse | All attribution (`scan_dims`, `holdout_check`) is SQL against `v_metric_deviation` / `ad_events_enriched`. |
+| Drill-down lives in ClickHouse | All attribution (`scan_dims`, `holdout_check`, `cross_check`) is SQL against `ad_events_enriched`, rendered from `metric_def`. |
 | Traceable | Not yet — Langfuse/OTel spans are the next build step (§5). |
 
 ---
@@ -104,7 +104,8 @@ conflates requests × fill × render and can't be attributed to one factor.
 
 Dashboard `RCA Metric Alerts` (`6a6df535ca45b0d18a585810`) — one raw-SQL number
 tile per alertable metric (`fill_rate`, `requests`, `ecpm`, `revenue`), each
-counting `is_anomaly=1` rows in `v_metric_deviation` for `dim_name='ALL'`. One
+summing `is_anomaly` per hour for `dim_name='ALL'`, from the query
+`scripts/metric_query.py alert <metric>` prints. One
 alert per tile, `thresholdType=above_exclusive` at `0` (fires only on a real
 row — **not** `above`, which fires unconditionally at zero; that was a real bug
 found in an earlier hand-built alert). Each alert's message is a static
@@ -121,18 +122,18 @@ uptime guarantee, URL changes on tunnel restart.
 
 - `app/main.py` — `POST /webhooks/alerts`, in-memory dedup on hash(title+body),
   regex-extracts `metric_id=(\w+)` from the body/title, validates it against
-  `metric_registry`, backgrounds the investigation.
-- `app/registry.py` — `get_metric(metric_id)` / `get_dim_priority(metric_id)`,
-  reads `metric_registry` / `metric_dim_priority` directly (no restated formulas).
+  `metric_def`, backgrounds the investigation.
+- `app/registry.py` — `get_metric(metric_id)` / `get_dim_map(metric_id)`,
+  reads `metric_def` / `metric_dim_map` directly (no restated formulas).
 - `app/investigate.py` — the ladder:
   1. `get_max_ts()` — `least(now(), max(event_time))`, so a bulk-loaded replay
      (whose `max(event_time)` can sit in the dataset's artificial future) still
      investigates the live/current window rather than the tail of the file.
   2. `reproduce_global` — recompute the metric's global anomalous hours over
-     the lookback window from `v_metric_deviation`. No anomaly is invented from
+     the lookback window, recomputed from silver. No anomaly is invented from
      the alert body; the alert only says *which metric*, never a value.
   3. `decompose` — for `revenue` only: walk the identity, find the driving factor.
-  4. `scan_dims` — per eligible dim (from `metric_dim_priority`, minus
+  4. `scan_dims` — per eligible dim (from `metric_dim_map`, minus
      `invalid_dims`), rank by `Σ |delta_abs| × sample_count` (contribution, not
      percentage change).
   5. `holdout_check` — recompute the metric on the complement of the top
@@ -149,8 +150,8 @@ uptime guarantee, URL changes on tunnel restart.
 `anomaly_events`, `v_incidents`, `mv_anomaly_feed`, `v_alert_feed`, `v_rca_queue`
 were dropped — a day-level incident ledger that duplicated what `investigate.py`
 now recomputes live per alert, and (`mv_anomaly_feed`/`v_alert_feed`/`v_rca_queue`)
-existed only in ClickHouse Cloud, never committed to `sql/`. `sql/06_detection.sql`
-now ends at `v_metric_deviation`. The one hand-built ClickStack alert that read
+existed only in ClickHouse Cloud, never committed to `sql/`. Detection is no
+longer a view at all — see `architecture.md`. The one hand-built ClickStack alert that read
 `v_alert_feed` (`fill_rate anomaly detected`) is marked `[DEPRECATED]` and its
 saved search repointed to a query that always returns zero rows, so it no longer
 errors or fires.
@@ -176,7 +177,7 @@ from the firing row.
 ## 5. Not yet built
 
 1. **Narration** — the one LLM call, turning the ledger into the 4-section
-   narrative in `docs/RCA_OUTPUT_CONTRACT.md` §2, with mechanical grounding
+   narrative described in `architecture.md` §4, with mechanical grounding
    (every number in the prose must exist in the ledger).
 2. **Langfuse trace** — one span per `investigate.py` stage, SQL text + row
    count + duration, flushed before the process exits. "No trace, no credit."
@@ -192,5 +193,5 @@ from the firing row.
 
 Figures came from `mcp__clickhouse-cloud__run_select_query` against service
 `b0fbe337-0412-46db-b97d-c9b6b792cb0f`, database `inmobi`, and from
-`RCA/app/investigate.py` run directly against `v_metric_deviation` /
+`RCA/app/investigate.py` run directly against
 `ad_events_enriched` for the replayed Android 15 incident window.

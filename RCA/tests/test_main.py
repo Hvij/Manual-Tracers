@@ -48,5 +48,18 @@ def test_known_metric_id_starts_investigation():
         "delivery_key": resp.json()["delivery_key"],
         "investigation": "started",
         "metric_id": "fill_rate",
+        "dimension_id": None,
     }
-    mocked_investigate.assert_called_once_with("fill_rate")
+    mocked_investigate.assert_called_once_with("fill_rate", None)
+
+
+def test_optional_dimension_id_is_passed_through_as_a_hint():
+    with patch("app.main.get_metric", return_value={"metric_id": "fill_rate"}), \
+         patch("app.main.run_investigation") as mocked_investigate, \
+         patch("app.main.narrate", return_value={"narrative": "stub", "grounded": True}):
+        resp = client.post(
+            "/webhooks/alerts",
+            json={**ALERT, "body": "metric_id=fill_rate dimension_id=os_version"},
+        )
+    assert resp.json()["dimension_id"] == "os_version"
+    mocked_investigate.assert_called_once_with("fill_rate", "os_version")

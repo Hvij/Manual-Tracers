@@ -30,7 +30,11 @@ bullet lists):
    "inconclusive", name the top candidate but say the holdout did not confirm it as the
    sole cause — a lead, not a conclusion. For "broad_based", say plainly that factor's
    movement is uniform across every tested dimension — never name a culprit that wasn't
-   confirmed.
+   confirmed. If "interaction" is present with verdict "interaction", the depth-1 cut alone
+   did not explain the move: the culprit is the PAIR, so name both the parent cut and
+   interaction.child_dim = interaction.top.child_value, give top_share and how many strata
+   were tested, and report that pair's own holdout verdict. If "interaction" carries only
+   "skipped", say the crossing step did not run and why, in plain words.
 4. Checked and ruled out — for each finding, how many candidate dimensions were tested
    (the length of its "candidates" list) and name only the "ruled_out" entries as the
    notable near-misses. Never list every cleared candidate.

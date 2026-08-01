@@ -22,7 +22,7 @@ ClickStack tile alert  (is_anomaly count > 0, message = "metric_id=revenue")
         ▼
 ┌─ main.py: receive_alert ────────────────────────────────────────────────┐
 │  dedup(sha256(title|body), 300s)  →  extract metric_id  →  validate     │
-│  against metric_registry  →  background_tasks.add_task(_investigate)    │
+│  against metric_def  →  background_tasks.add_task(_investigate)    │
 └───────────────────────────────────────────────────────────────────────┬─┘
                                                                           ▼
 ┌─ run_investigation(metric_id) ──────────────────────────────────────────┐
@@ -43,7 +43,7 @@ ClickStack tile alert  (is_anomaly count > 0, message = "metric_id=revenue")
 │  │      share_f            = g_f / G                                 │  │
 │  │      contribution_rel_f = share_f × revenue.delta_rel             │  │
 │  │      verdict_f = implicated  if |contribution_rel_f| ≥            │  │
-│  │                  min_effect_rel_f  (f's own metric_registry row)  │  │
+│  │                  min_effect_rel_f  (f's own metric_def row)  │  │
 │  │                  else cleared                                     │  │
 │  └────────────────────────────────────────────────────────────────────┘  │
 │         │                                                               │
@@ -93,7 +93,7 @@ already built and verified for the `fill_rate`/Android-15 incident.
 
 ## 2. The math
 
-Notation: `actual_x`, `expected_x` are the values `v_metric_deviation` already computed
+Notation: `actual_x`, `expected_x` are the values the deviation query already computed
 for series `x` (global or a factor); `delta_rel_x = (actual_x − expected_x) / expected_x`.
 
 ### 2.1 Detection (unchanged — full detail in `architecture.md`)
@@ -161,7 +161,7 @@ G = g_requests + g_fillrate + g_renderrate + g_ecpm
   = ln(Revenue_actual / Revenue_expected)          ← exact, by the identity above
 ```
 
-To express each factor's share in the units already read off `v_metric_deviation`
+To express each factor's share in the units the deviation query already reports
 (`delta_rel`), allocate revenue's *observed* relative move proportionally to each factor's
 share of the total log-move:
 
@@ -174,7 +174,7 @@ By construction, `Σ_f contribution_rel_f = revenue.delta_rel` exactly — contr
 to the total because `Σ_f share_f = 1`, not because it's asserted.
 
 **Implicated / cleared.** `f` is `implicated` if `|contribution_rel_f| ≥ min_effect_rel_f`,
-reusing that factor's own row in `metric_registry` (`sql/05_metric_layer.sql`) —
+reusing that factor's own row in `metric_def` (`sql/04_semantic_layer.sql`) —
 `fill_rate → 0.02`, `render_rate → 0.02`, `ecpm → 0.03`, `requests → 0.05`. No new
 threshold is invented for this step. Otherwise `cleared`.
 

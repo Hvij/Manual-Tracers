@@ -6,7 +6,7 @@ is computed — not narrated into existence.
 
 - **Architecture:** [architecture.md](architecture.md)
 - **As-built RCA agent design:** [docs/RCA_AGENT_DESIGN.md](docs/RCA_AGENT_DESIGN.md)
-- **RCA output contract:** [docs/RCA_OUTPUT_CONTRACT.md](docs/RCA_OUTPUT_CONTRACT.md)
+- **Decomposition math:** [docs/RCA_DECOMPOSITION_MATH.md](docs/RCA_DECOMPOSITION_MATH.md)
 - **Problem statement:** [InMobi/PROBLEM_STATEMENT.md](InMobi/PROBLEM_STATEMENT.md)
 - **Metric definitions:** [InMobi/metrics_glossary.md](InMobi/metrics_glossary.md)
 
@@ -14,25 +14,32 @@ is computed — not narrated into existence.
 
 | Layer | Object | Role |
 |---|---|---|
-| bronze | `inmobi.ad_events` | raw, replayed |
-| silver | `inmobi.ad_events_enriched` | denormalised via dictionaries · RCA drill surface |
-| gold | `inmobi.metric_1h` | hourly marginals · **alert surface** (~53K rows) |
-| metric layer | `v_metric_points` | the only place a formula is written |
-| detection | `v_metric_baseline` → `v_metric_deviation` | seasonal baseline, guard-railed scoring |
-| alert → agent | ClickStack tile alert on `v_metric_deviation` → webhook → `RCA/app/` | see [docs/RCA_AGENT_DESIGN.md](docs/RCA_AGENT_DESIGN.md) §3 |
+| data | `inmobi.ad_events` → `inmobi.ad_events_enriched` | one MV, dictionary-denormalised, `event_time` indexed. Everything reads the second table |
+| semantic | `inmobi.metric_def` | `metric_id` · `sql` · `dependencies` (funnel factors) · `z_score_threshold` + guard rails |
+| semantic | `inmobi.metric_dim_map` | `(metric_id, dim_id)` · `priority` · `dependencies` (cuts to cross with) |
+| detection | `RCA/app/metric_sql.py` | renders a `metric_def` row into one query: hourly series → seasonal baseline → z → `is_anomaly` |
+| alert → agent | HyperDX chart on that query → webhook → `RCA/app/` | see [docs/RCA_AGENT_DESIGN.md](docs/RCA_AGENT_DESIGN.md) §3 |
 
-No persisted incident table sits between detection and the agent — it
-re-derives everything live per alert. An earlier `v_incidents`/`anomaly_events`
-ledger was removed as a duplicate source of truth.
+**Nothing is pre-aggregated and nothing is persisted between detection and the
+agent.** `metric_def.sql` executes directly against `ad_events_enriched`, and the
+detection maths exists in one builder rendered two ways — bound parameters for the
+agent, `now()`-relative for HyperDX — so an alert and the investigation behind it
+cannot disagree.
 
 ## Run
 
 ```bash
 cp .env.example .env      # fill in ClickHouse Cloud creds
-./scripts/replay.sh       # apply SQL + replay ad_events; MVs populate silver + gold
+./scripts/replay.sh       # apply SQL + replay ad_events; MV1 populates the enriched table
 ```
 
 Modes: `--schema` (DDL only) · `--data` (replay only) · `--dims` (reload dimensions).
+
+```bash
+./scripts/metric_query.py alert fill_rate   # SQL to paste into a HyperDX chart
+./scripts/metric_query.py scan  fill_rate   # ranked segment scan
+cd RCA && uv run pytest -q                  # 39 tests, no ClickHouse needed
+```
 
 **Sealed dataset:** change `AD_EVENTS_FILE` at the top of `scripts/replay.sh`,
 truncate manually (helper at the bottom of the script), then re-run. The script
@@ -46,4 +53,6 @@ never truncates by itself.
 | Jun 29–30 | `os_version=iOS 18.1` | 0.683 | 0.780 | 10.6 |
 | Jun 23–25 | global fill rate | 0.750 | 0.785 | 11.4 |
 
-~2s over 9M rows.
+Measured over 9M rows before the pipeline was rebuilt without the view chain. The
+formulas, baseline and guard rails are unchanged, so these are the numbers to
+expect again — re-confirm after ingest rather than quoting them as current.
