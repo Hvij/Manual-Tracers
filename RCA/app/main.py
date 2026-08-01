@@ -1,36 +1,25 @@
-import hashlib
 import json
 import logging
 import re
-import time
 
 from fastapi import BackgroundTasks, FastAPI, status
 
+from app import tracing
 from app.investigate import run_investigation
+from app.narrate import narrate
 from app.registry import get_metric
 from app.schemas import ClickStackAlertPayload
+from app.utils import TTLCache, sha256_hex
 
 METRIC_ID_RE = re.compile(r"metric_id=(\w+)")
+DEDUP_WINDOW_S = 300
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("rca_agent")
 
 app = FastAPI(title="RCA Agent Webhook")
 
-# ponytail: in-memory dedup, good for one process only — move to a ClickHouse/redis
-# table if this ever runs behind more than one worker.
-_seen: dict[str, float] = {}
-_DEDUP_WINDOW_S = 300
-
-
-def _dedup_key(payload: ClickStackAlertPayload) -> str:
-    return hashlib.sha256(f"{payload.title}|{payload.body}".encode()).hexdigest()
-
-
-def _cleanup(now: float) -> None:
-    stale = [k for k, ts in _seen.items() if now - ts > _DEDUP_WINDOW_S]
-    for k in stale:
-        del _seen[k]
+_dedup = TTLCache(ttl_seconds=DEDUP_WINDOW_S)
 
 
 @app.get("/health")
@@ -45,20 +34,22 @@ def _extract_metric_id(payload: ClickStackAlertPayload) -> str | None:
 
 def _investigate(metric_id: str) -> None:
     ledger = run_investigation(metric_id)
-    logger.info("investigation for %s -> %s", metric_id, json.dumps(ledger, default=str))
+    result = narrate(ledger)
+    logger.info(
+        "investigation for %s -> %s",
+        metric_id,
+        json.dumps({"ledger": ledger, **result}, default=str),
+    )
+    tracing.flush()
 
 
 @app.post("/webhooks/alerts", status_code=status.HTTP_202_ACCEPTED)
 async def receive_alert(payload: ClickStackAlertPayload, background_tasks: BackgroundTasks):
-    now = time.time()
-    _cleanup(now)
-
-    key = _dedup_key(payload)
-    if key in _seen:
+    key = sha256_hex(payload.title, payload.body)
+    if _dedup.seen(key):
         logger.info("duplicate alert ignored: %s", payload.title)
         return {"status": "duplicate", "delivery_key": key}
 
-    _seen[key] = now
     logger.info("alert received: title=%r body=%r link=%r", payload.title, payload.body, payload.link)
 
     metric_id = _extract_metric_id(payload)

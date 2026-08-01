@@ -1,11 +1,10 @@
-import os
-from pathlib import Path
+import time
 from typing import Any
 
 import clickhouse_connect
-from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parents[2] / ".env")
+from app import tracing
+from app.settings import get_settings
 
 _client = None
 
@@ -13,11 +12,12 @@ _client = None
 def get_client():
     global _client
     if _client is None:
+        settings = get_settings()
         _client = clickhouse_connect.get_client(
-            host=os.environ["CLICKHOUSE_HOST"],
-            port=int(os.environ["CLICKHOUSE_HTTP_PORT"]),
-            username=os.environ["CLICKHOUSE_USER"],
-            password=os.environ["CLICKHOUSE_PASSWORD"],
+            host=settings.clickhouse_host,
+            port=settings.clickhouse_http_port,
+            username=settings.clickhouse_user,
+            password=settings.clickhouse_password,
             database="inmobi",
             secure=True,
         )
@@ -25,6 +25,16 @@ def get_client():
 
 
 def query_rows(sql: str, parameters: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    start = time.monotonic()
     result = get_client().query(sql, parameters=parameters)
+    elapsed_s = time.monotonic() - start
+
     columns = result.column_names
-    return [dict(zip(columns, row)) for row in result.result_rows]
+    rows = [dict(zip(columns, row)) for row in result.result_rows]
+
+    summary = getattr(result, "summary", None) or {}
+    read_rows = summary.get("read_rows") if isinstance(summary, dict) else None
+    tracing.record_query(sql, parameters, getattr(result, "query_id", None),
+                          read_rows if read_rows is not None else len(rows), elapsed_s)
+
+    return rows

@@ -17,6 +17,7 @@ elegant, but never trade away correctness or traceability, which are what is sco
 | `architecture.md` | System design and the reasoning behind it |
 | `docs/RCA_AGENT_DESIGN.md` | **As-built.** What actually runs today (`RCA/app/`), vs. what's still to build |
 | `docs/RCA_OUTPUT_CONTRACT.md` | The ledger, the narrative, the trace, the webhook payload (target shape; §4 matches reality) |
+| `docs/RCA_DECOMPOSITION_MATH.md` | Design spec (not yet built): multi-factor revenue decomposition math + corrected pipeline diagram |
 | `docs/WORK_HARSH_DATA.md` | Harsh's queue |
 | `docs/WORK_ML_AGENT.md` | Partner's queue |
 

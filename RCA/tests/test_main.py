@@ -40,7 +40,8 @@ def test_unknown_metric_id_skips_investigation():
 
 def test_known_metric_id_starts_investigation():
     with patch("app.main.get_metric", return_value={"metric_id": "fill_rate"}), \
-         patch("app.main.run_investigation") as mocked_investigate:
+         patch("app.main.run_investigation") as mocked_investigate, \
+         patch("app.main.narrate", return_value={"narrative": "stub", "grounded": True}):
         resp = client.post("/webhooks/alerts", json={**ALERT, "body": "metric_id=fill_rate"})
     assert resp.json() == {
         "status": "accepted",

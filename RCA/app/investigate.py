@@ -1,10 +1,17 @@
+import math
 from datetime import timedelta
 from statistics import mean
 
 from app.clickhouse_client import query_rows
 from app.registry import get_dim_priority, get_metric
+from app.tracing import traced
 
 REVENUE_IDENTITY_FACTORS = ["requests", "fill_rate", "render_rate", "ecpm"]
+
+# guard against dividing by a near-zero total log-move when identity factors offset each
+# other (e.g. fill_rate down, ecpm up, net revenue roughly flat) — see
+# docs/RCA_DECOMPOSITION_MATH.md §2.4 "degenerate-G guard rail"
+EPSILON_G = 0.005
 
 # raw ad_events_enriched expression for each metric_registry numerator/denominator name
 RAW_EXPR = {
@@ -30,6 +37,7 @@ def get_max_ts():
     return rows[0]["max_ts"]
 
 
+@traced("reproduce_global")
 def reproduce_global(metric_id: str, start, end) -> list[dict]:
     return query_rows(
         "SELECT ts, actual, expected, z_score, delta_rel, is_anomaly "
@@ -44,20 +52,73 @@ def _anomalous(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r["is_anomaly"]]
 
 
-def decompose(start, end) -> dict:
-    """Walk the revenue identity before touching any dimension (CLAUDE.md rule 5)."""
-    checked = []
+def _mean_actual_expected(rows: list[dict]) -> tuple[float, float] | None:
+    if not rows:
+        return None
+    return mean(r["actual"] for r in rows), mean(r["expected"] for r in rows)
+
+
+def _global_summary(rows: list[dict]) -> dict:
+    actual, expected = _mean_actual_expected(rows)
+    return {"actual": actual, "expected": expected, "hours": len(rows),
+             "peak_abs_z": max(abs(r["z_score"]) for r in rows)}
+
+
+def _log_growth(actual: float, expected: float) -> float:
+    if actual <= 0 or expected <= 0:
+        return 0.0
+    return math.log(actual / expected)
+
+
+def compute_factor_contributions(growth: dict[str, float], total_delta_rel: float,
+                                   min_effect_rel: dict[str, float]) -> dict:
+    """Pure log-share allocation, split out from decompose() so the share/offsetting math is
+    unit-testable without a ClickHouse round-trip — same pattern as compute_holdout_verdict.
+    ln(Revenue_actual/Revenue_expected) = sum(ln(factor_actual/factor_expected)) is exact
+    (log of a product is the sum of logs), so each factor's share of that total log-move is
+    used to allocate the *observed* revenue delta_rel — contributions sum to the total by
+    construction. See docs/RCA_DECOMPOSITION_MATH.md §2.4."""
+    total_growth = sum(growth.values())
+    offsetting = abs(total_growth) < EPSILON_G
+
+    factors = []
+    for metric_id, g in growth.items():
+        contribution_rel = g if offsetting else (g / total_growth) * total_delta_rel
+        verdict = "implicated" if abs(contribution_rel) >= min_effect_rel[metric_id] else "cleared"
+        factors.append({
+            "metric_id": metric_id, "log_growth": g,
+            "contribution_rel": contribution_rel, "verdict": verdict,
+        })
+    return {"total_revenue_delta_rel": total_delta_rel, "offsetting": offsetting, "factors": factors}
+
+
+@traced("decompose")
+def decompose(anomalous_rows: list[dict], start, end) -> dict:
+    """Walk the revenue identity before touching any dimension (CLAUDE.md rule 5). Every
+    factor gets a verdict — not just the loudest one — per CLAUDE.md rule 6."""
+    total_actual, total_expected = _mean_actual_expected(anomalous_rows)
+    total_delta_rel = (total_actual - total_expected) / total_expected
+    anomalous_ts = {r["ts"] for r in anomalous_rows}
+
+    factor_rows = {}
+    growth = {}
     for factor in REVENUE_IDENTITY_FACTORS:
-        anomalous = _anomalous(reproduce_global(factor, start, end))
-        peak_z = max((abs(r["z_score"]) for r in anomalous), default=0.0)
-        checked.append({"metric_id": factor, "anomalous_hours": len(anomalous), "peak_abs_z": peak_z})
-    driving = max(checked, key=lambda c: c["peak_abs_z"])
-    return {
-        "factors_checked": checked,
-        "driving_factor": driving["metric_id"] if driving["peak_abs_z"] > 0 else None,
-    }
+        rows = [r for r in reproduce_global(factor, start, end) if r["ts"] in anomalous_ts]
+        factor_rows[factor] = rows
+        means = _mean_actual_expected(rows)
+        growth[factor] = _log_growth(*means) if means else 0.0
+
+    min_effect_rel = {f: get_metric(f)["min_effect_rel"] for f in REVENUE_IDENTITY_FACTORS}
+    result = compute_factor_contributions(growth, total_delta_rel, min_effect_rel)
+
+    for entry in result["factors"]:
+        rows = factor_rows[entry["metric_id"]]
+        entry["global"] = _global_summary(rows) if rows else None
+
+    return result
 
 
+@traced("scan_dims")
 def scan_dims(metric_id: str, start, end) -> list[dict]:
     meta = get_metric(metric_id)
     invalid = set(meta["invalid_dims"] or [])
@@ -86,6 +147,7 @@ def compute_holdout_verdict(candidate_delta: float, residual_delta: float,
     return "localized" if ratio <= ratio_threshold else "inconclusive"
 
 
+@traced("holdout_check")
 def holdout_check(metric_id: str, candidate: dict, global_expected_ref: float, start, end) -> dict:
     dim_col = candidate["dim_name"]
     if dim_col not in DIMENSION_COLUMNS:
@@ -117,6 +179,29 @@ def holdout_check(metric_id: str, candidate: dict, global_expected_ref: float, s
     }
 
 
+@traced("investigate_factor")
+def _investigate_factor(target_metric: str, global_summary: dict, start, end) -> dict:
+    candidates = scan_dims(target_metric, start, end)
+    if not candidates:
+        return {"factor": target_metric, "global": global_summary, "verdict": "broad_based",
+                 "candidates": [], "ruled_out": []}
+
+    holdout = holdout_check(target_metric, candidates[0], global_summary["expected"], start, end)
+    ruled_out = (
+        [f"{c['dim_name']}={c['dim_value']}" for c in candidates[1:]]
+        if holdout["verdict"] == "localized" else []
+    )
+    return {
+        "factor": target_metric,
+        "global": global_summary,
+        "candidates": candidates[:10],
+        "holdout": holdout,
+        "verdict": holdout["verdict"],
+        "ruled_out": ruled_out,
+    }
+
+
+@traced("run_investigation")
 def run_investigation(metric_id: str, lookback_hours: int = 24) -> dict:
     meta = get_metric(metric_id)
     if meta is None:
@@ -126,47 +211,32 @@ def run_investigation(metric_id: str, lookback_hours: int = 24) -> dict:
     start, end = max_ts - timedelta(hours=lookback_hours), max_ts
     window = {"start": start.isoformat(), "end": end.isoformat()}
 
-    target_metric = metric_id
+    anomalous = _anomalous(reproduce_global(metric_id, start, end))
+    if not anomalous:
+        return {"metric_id": metric_id, "window": window, "verdict": "not_reproducible"}
+
     decomposition = None
     if meta["level"] == 1:
-        decomposition = decompose(start, end)
-        if not decomposition["driving_factor"]:
+        decomposition = decompose(anomalous, start, end)
+        implicated = [f for f in decomposition["factors"] if f["verdict"] == "implicated"]
+        if not implicated:
             return {"metric_id": metric_id, "window": window, "decomposition": decomposition,
                      "verdict": "not_reproducible"}
-        target_metric = decomposition["driving_factor"]
+        findings = [_investigate_factor(f["metric_id"], f["global"], start, end) for f in implicated]
+    else:
+        findings = [_investigate_factor(metric_id, _global_summary(anomalous), start, end)]
 
-    anomalous = _anomalous(reproduce_global(target_metric, start, end))
-    if not anomalous:
-        return {"metric_id": metric_id, "target_metric": target_metric, "window": window,
-                 "decomposition": decomposition, "verdict": "not_reproducible"}
-
-    global_summary = {
-        "actual": mean(r["actual"] for r in anomalous),
-        "expected": mean(r["expected"] for r in anomalous),
-        "anomalous_hours": len(anomalous),
-        "peak_abs_z": max(abs(r["z_score"]) for r in anomalous),
-    }
-
-    candidates = scan_dims(target_metric, start, end)
-    if not candidates:
-        return {"metric_id": metric_id, "target_metric": target_metric, "window": window,
-                 "decomposition": decomposition, "global": global_summary,
-                 "verdict": "broad_based", "ruled_out": []}
-
-    holdout = holdout_check(target_metric, candidates[0], global_summary["expected"], start, end)
-    ruled_out = (
-        [f"{c['dim_name']}={c['dim_value']}" for c in candidates[1:]]
-        if holdout["verdict"] == "localized" else []
+    verdicts = {f["verdict"] for f in findings}
+    overall_verdict = (
+        "localized" if "localized" in verdicts else
+        "inconclusive" if "inconclusive" in verdicts else
+        "broad_based"
     )
 
     return {
         "metric_id": metric_id,
-        "target_metric": target_metric,
         "window": window,
         "decomposition": decomposition,
-        "global": global_summary,
-        "candidates": candidates[:10],
-        "holdout": holdout,
-        "verdict": holdout["verdict"],
-        "ruled_out": ruled_out,
+        "findings": findings,
+        "verdict": overall_verdict,
     }

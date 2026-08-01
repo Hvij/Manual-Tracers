@@ -1,0 +1,58 @@
+from app.grounding import allowed_numbers, check_grounding, fallback_summary
+
+# real numbers from the Android 15 / fill_rate incident (2026-07-30 window), same shape
+# run_investigation returns: decomposition=None for an L2 metric, one finding.
+LEDGER = {
+    "metric_id": "fill_rate",
+    "window": {"start": "2026-07-30T12:00:00", "end": "2026-07-30T23:00:00"},
+    "decomposition": None,
+    "findings": [
+        {
+            "factor": "fill_rate",
+            "global": {"actual": 0.7499, "expected": 0.7813, "hours": 12, "peak_abs_z": 9.17},
+            "candidates": [
+                {"dim_name": "os_version", "dim_value": "Android 15", "avg_actual": 0.4287,
+                 "avg_expected": 0.7449, "peak_abs_z": 23.79, "contribution": 4208.36},
+                {"dim_name": "publisher_tier", "dim_value": "tier_2", "avg_actual": 0.7792,
+                 "avg_expected": 0.8089, "peak_abs_z": 6.68, "contribution": 1790.85},
+            ],
+            "holdout": {
+                "candidate": {"dim_name": "os_version", "dim_value": "Android 15"},
+                "residual_actual": 0.7841, "residual_delta": 0.0029,
+                "candidate_delta": -0.3162, "verdict": "localized",
+            },
+            "verdict": "localized",
+            "ruled_out": ["publisher_tier=tier_2"],
+        }
+    ],
+    "verdict": "localized",
+}
+
+
+def test_allowed_numbers_covers_exact_and_percentage_forms():
+    allowed = allowed_numbers(LEDGER)
+    assert "0.7499" in allowed          # exact echo of a raw ledger float
+    assert "42.87" in allowed           # 0.4287 rendered as a percentage
+    assert "23.79" in allowed           # a peak_abs_z, matched directly
+    assert "15" in allowed              # digit run from the "Android 15" dim_value string
+
+
+def test_check_grounding_passes_a_clean_narrative():
+    clean = (
+        "fill_rate actual 0.7499 vs expected 0.7813, peak z 9.17. "
+        "os_version=Android 15 confirmed, contribution 4208.36."
+    )
+    assert check_grounding(clean, allowed_numbers(LEDGER)) == []
+
+
+def test_check_grounding_flags_a_fabricated_number():
+    fabricated = "fill_rate actually dropped to 0.1234, a figure nowhere in the ledger."
+    ungrounded = check_grounding(fabricated, allowed_numbers(LEDGER))
+    assert "0.1234" in ungrounded
+
+
+def test_fallback_summary_needs_no_llm_and_names_the_key_facts():
+    summary = fallback_summary(LEDGER)
+    assert "fill_rate" in summary
+    assert "localized" in summary
+    assert "Android 15" in summary
