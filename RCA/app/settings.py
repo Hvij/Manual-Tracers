@@ -1,6 +1,7 @@
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import AliasChoices, Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -14,7 +15,10 @@ class Settings(BaseSettings):
     )
 
     clickhouse_host: str
-    clickhouse_http_port: int
+    # Repo .env uses CLICKHOUSE_HTTPS_PORT (ClickHouse Cloud); accept either name.
+    clickhouse_http_port: int = Field(
+        validation_alias=AliasChoices("CLICKHOUSE_HTTP_PORT", "CLICKHOUSE_HTTPS_PORT"),
+    )
     clickhouse_user: str
     clickhouse_password: str
 
