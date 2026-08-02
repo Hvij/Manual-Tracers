@@ -20,11 +20,17 @@ from app.schemas import (
 from app.utils import TTLCache, sha256_hex
 
 METRIC_ID_RE = re.compile(r"metric_id=(\w+)")
-# Optional, and ClickStack cannot currently produce it — its webhook template exposes only
-# {{title}}/{{body}}/{{link}}, with no access to the firing row's group-by value. Parsed
-# anyway so an alerting source that CAN name a segment is a config change, not a code change.
-# It is only ever a hint: investigate.py re-derives every number regardless.
-DIMENSION_ID_RE = re.compile(r"dimension_id=(\w+)")
+# The *webhook body* template really is limited to {{title}}/{{body}}/{{link}}, but an
+# *alert message* also substitutes {{group}} and {{value}} — so a grouped tile does name the
+# slice that fired, and scripts/provision_alerts.py puts it in as `dimension_id={{group}}`.
+#
+# ClickStack renders a two-column group as `dim_name:country, dim_value:CA`, so the optional
+# `dim_name:` prefix is what has to be stripped to recover the dimension id. Plain
+# `dimension_id=os_version` still matches, for any alert source that names it directly.
+#
+# It is only ever a hint: investigate.py re-derives every number regardless, and an id that
+# fails the registry whitelist in _dim_col just widens the first scan instead of narrowing it.
+DIMENSION_ID_RE = re.compile(r"dimension_id=(?:dim_name:)?(\w+)")
 DEDUP_WINDOW_S = 300
 
 logging.basicConfig(level=logging.INFO)

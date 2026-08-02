@@ -99,23 +99,62 @@ live by both, is what rules that out.
 
 ---
 
-## 3. What compression will look like (not built yet)
+## 3. Compression — as built
 
-`bucket_seconds < 3600` is the case the machinery above already exists for,
-but nothing sets it — there is no `scripts/compress_replay.py` in this repo
-yet. When it's built, the intent is:
+`scripts/compress_replay.py` sets `bucket_seconds < 3600`. It rewrites
+`event_time` for the whole dataset so a data-hour occupies `bucket_seconds`
+wall-clock seconds instead of 3600, anchored at `now()`, then updates the single
+`inmobi.replay_clock` row to match. At `bucket_seconds = 2`, 840 data-hours
+stream past in 28 minutes.
 
-1. Rewrite `event_time` for the whole dataset so a data-hour occupies
-   `bucket_seconds` wall-clock seconds instead of 3600 — e.g. at
-   `bucket_seconds = 1`, 35 days (840 data-hours) streams past in 14 minutes
-   of real time, so a live HyperDX alert can fire during a demo instead of
-   waiting on the actual calendar.
-2. Update the single `inmobi.replay_clock` row to match
-   (`bucket_seconds`, `anchor`, `origin_dow`) for that rewrite.
-3. Nothing else changes. Both `deviation_sql()` call sites already read
-   `get_clock()` live, so the next query either renderer issues automatically
-   buckets and computes seasonality on the compressed clock — no redeploy,
-   no code change, no second table.
+```bash
+./scripts/compress_replay.py --bucket-seconds 2
+./scripts/provision_alerts.py --apply        # ALWAYS, see below
+```
+
+### It is re-runnable, and that took a fix
+
+The obvious implementation derives the data-hour index as
+`intDiv(event_time - min(event_time), 3600)`. That is correct **only on
+real-time rows**. Run it a second time, over an already-compressed replay where
+a data-hour is one second, and `intDiv` by 3600 collapses all 840 buckets into
+one — 9M rows at a single timestamp.
+
+This matters because re-running is the normal case, not the exception: the
+sealed dataset arrives late and the demo pace gets retuned, and neither can
+require a full `replay.sh` reload first. So the script detects its input. A
+previous compression is recognisable because its whole span is far shorter than
+the calendar hours it claims to cover, and inverting it is exact — `replay_clock`
+records the `anchor` and `bucket_seconds` that produced it. `origin_dow` is
+carried forward rather than re-read, because a compressed calendar cannot be
+read off the timestamps.
+
+### Tiles are rendered against the clock; the agent is not
+
+This is the one coupling that bites. `metric_sql._clock_exprs()` bakes the
+bucket, hour-of-day and weekend expressions into the **query text**. The agent
+re-reads `replay_clock` on every query, so it follows a clock change for free.
+A saved HyperDX tile does not — it holds the SQL string it was created with, and
+keeps scoring the previous clock until re-rendered.
+
+**Every compression must therefore be followed by
+`./scripts/provision_alerts.py --apply`.** `compress_replay.py` prints that
+reminder as its last line.
+
+### Windows are counted in data-hours, never in real time
+
+`metric_sql.window_seconds(buckets, clock)` converts a span expressed in
+data-hours into wall-clock seconds. Writing a lookback directly as
+`INTERVAL 24 HOUR` or `timedelta(hours=24)` is correct only at real time; at
+`bucket_seconds = 2` it reaches past the entire dataset, and the "last 24 hours"
+silently becomes all 35 days — which reads as a flat baseline and reports every
+real incident as `not_reproducible`.
+
+`metric_sql.lookback_buckets(clock)` additionally widens the agent's window to at
+least one alert evaluation. ClickStack's interval enum bottoms out at `1m`, so a
+compressed replay cannot be alerted on at its own pace: at `bucket_seconds = 2`
+one evaluation covers 30 data-hours. Investigating a narrower window than the
+alert scored would drop the anomaly that fired it.
 
 The `time shift` mechanism (§1) is unaffected and still runs first, at load —
 compression and the week-shift solve different problems and compose: the
@@ -128,11 +167,13 @@ subsequent query interprets time within that data.
 
 ```
 load time  (once, replay.sh):        event_time += TIME_SHIFT_WEEKS weeks
+compress   (re-runnable):            event_time  = anchor + hour_index * bucket_seconds
 query time (every render, both):     bucket/hour/weekend ← replay_clock row
 ```
 
 - Change `TIME_SHIFT_WEEKS` → re-run `replay.sh --data` (rewrites stored rows).
-- Change `replay_clock` → nothing to re-run; the next query from either
-  renderer picks it up.
+- Change `replay_clock` → the **agent** picks it up on its next query; **HyperDX
+  tiles do not**, they hold rendered SQL. Re-run
+  `./scripts/provision_alerts.py --apply`.
 - Confirm what's active: `SELECT * FROM inmobi.replay_clock FINAL` — anything
   other than `(3600, 0, 0)` means compression is live.

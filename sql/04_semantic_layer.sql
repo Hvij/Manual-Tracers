@@ -26,6 +26,14 @@ CREATE TABLE IF NOT EXISTS inmobi.metric_def
     denominator     String,  -- '' for additive metrics
     is_ratio        UInt8,
     detector        String,  -- proportion | robust_z
+    -- Does this metric get a HyperDX tile? A measured decision, not a structural one:
+    -- ctr's noisiest clean day (z~3.3) scores HIGHER than its worst real incident (z~2.5),
+    -- so any threshold either fires on noise or catches nothing; render_rate never moves
+    -- materially and is a free "ruled out" control rather than a detector. See
+    -- docs/RCA_AGENT_DESIGN.md §2.2 for the separation table this comes from.
+    -- Deriving alertability from structure instead (has dimensions / has dependencies) puts
+    -- both back on tiles and they immediately cry wolf, which is the top scored criterion.
+    alertable       UInt8,
     dependencies    Array(String), -- funnel factors this decomposes into, IN FUNNEL ORDER
     z_score_threshold Float64,     -- |z| this metric must clear to be an anomaly
     min_samples     UInt64,  -- minimum requests in the bucket to evaluate at all
@@ -63,31 +71,37 @@ ORDER BY metric_id;
 -- would silently hide the single largest planted incident in the dataset.
 -- Rule of thumb: min_samples ~= 5% of the global hourly request rate.
 INSERT INTO inmobi.metric_def
-(metric_id, sql, numerator, denominator, is_ratio, detector, dependencies,
+(metric_id, sql, numerator, denominator, is_ratio, detector, alertable, dependencies,
  z_score_threshold, min_samples, min_effect_rel, min_effect_abs, invalid_dims) VALUES
 -- the outcome. The only metric with dependencies, so the only one that decomposes.
 ('revenue', 'sum(revenue)',
- 'sum(revenue)', '', 0, 'robust_z',
+ 'sum(revenue)', '', 0, 'robust_z', 1,
  ['requests','fill_rate','render_rate','ecpm'], 4.0, 2000, 0.03, 0.0, []),
 -- the identity factors: Revenue = Requests x FillRate x RenderRate x eCPM/1000
 ('requests', 'toFloat64(count())',
- 'toFloat64(count())', '', 0, 'robust_z',
+ 'toFloat64(count())', '', 0, 'robust_z', 1,
  [], 4.0, 2000, 0.05, 0.0, ['vertical','campaign_type']),
 ('fill_rate', 'sum(is_filled) / nullIf(toFloat64(count()), 0)',
- 'sum(is_filled)', 'toFloat64(count())', 1, 'proportion',
+ 'sum(is_filled)', 'toFloat64(count())', 1, 'proportion', 1,
  [], 4.0, 500, 0.02, 0.01, ['vertical','campaign_type']),
+-- alertable = 0: separation ~1x. render_rate never moves materially, so it earns its keep
+-- as a factor that gets *cleared* during decomposition, not as a detector.
 ('render_rate', 'sum(is_impression) / nullIf(toFloat64(sum(is_filled)), 0)',
- 'sum(is_impression)', 'toFloat64(sum(is_filled))', 1, 'proportion',
+ 'sum(is_impression)', 'toFloat64(sum(is_filled))', 1, 'proportion', 0,
  [], 4.0, 500, 0.02, 0.01, ['vertical','campaign_type']),
 ('ecpm', 'sum(revenue) / nullIf(toFloat64(sum(is_impression)), 0) * 1000',
- 'sum(revenue)', 'toFloat64(sum(is_impression))', 1, 'robust_z',
+ 'sum(revenue)', 'toFloat64(sum(is_impression))', 1, 'robust_z', 1,
  [], 4.0, 500, 0.03, 0.0, []),
--- context, not a revenue factor in a CPM model
+-- context, not a revenue factor in a CPM model.
+-- alertable = 0: separation < 1x — ctr's noisiest clean day outscores its worst real
+-- incident, so a tile on it fires on noise by construction. Measured, see
+-- docs/RCA_AGENT_DESIGN.md 2.2; confirmed again on the compressed replay, where a ctr
+-- marginal tile flagged device_model='Galaxy S23' at a contribution of 9.
 ('ctr', 'sum(is_click) / nullIf(toFloat64(sum(is_impression)), 0)',
- 'sum(is_click)', 'toFloat64(sum(is_impression))', 1, 'proportion',
+ 'sum(is_click)', 'toFloat64(sum(is_impression))', 1, 'proportion', 0,
  [], 4.0, 500, 0.05, 0.002, []),
 ('rpr', 'sum(revenue) / nullIf(toFloat64(count()), 0)',
- 'sum(revenue)', 'toFloat64(count())', 1, 'robust_z',
+ 'sum(revenue)', 'toFloat64(count())', 1, 'robust_z', 0,
  [], 4.0, 2000, 0.03, 0.0, ['vertical','campaign_type']);
 
 -- ---------------------------------------------------------------------

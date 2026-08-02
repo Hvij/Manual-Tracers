@@ -65,17 +65,25 @@ The RCA agent is its own `uv` project in `RCA/` — `main.py` (webhook),
 `metric_sql.py` (the query builder), `registry.py` (`metric_def` /
 `metric_dim_map` lookups).
 
-`scripts/metric_query.py alert <metric>` prints the HyperDX chart SQL;
-`scripts/metric_query.py scan <metric>` prints the ranked segment scan
-(`replay.sh` runs it as its post-load verification).
+`scripts/metric_query.py` renders every detection query from the same builder:
+`alert` (global tile), `marginal` (per-slice sentinel tile), `freshness` (ops
+tile), `scan` (ranked segment scan; `replay.sh` runs it as post-load
+verification). `scripts/provision_alerts.py --apply` renders all of them from
+the registry and pushes the dashboard + alerts to ClickStack.
 
 ## Non-negotiable design rules
 
-1. **Alert on the global series, enumerate marginals at drill time, never the
-   cross-product.** That cross-product is 767,984 combos (measured). Alerts read
-   `dim_name = 'ALL'`; depth 1 fans 62 marginal slices out with one `ARRAY JOIN`
-   in a single pass; depth 2 crosses only what `metric_dim_map.dependencies` says
-   is entangled with the cut that led.
+1. **Alert on the global series *and* on the marginals — never on the
+   cross-product.** That cross-product is 767,984 combos (measured); the
+   marginals are 62 and cost one `ARRAY JOIN` pass. Global-only alerting was the
+   original rule and it silently missed segment-confined incidents: measured on
+   the replay, the planted `os_version=iOS 18.1` fault scores **0 anomalies on
+   the global `fill_rate` tile** while the marginal tile catches it at z 8.1–9.5.
+   So there are two tiles per metric. Depth 2 is still never enumerated — it
+   crosses only what `metric_dim_map.dependencies` says is entangled with the cut
+   that led. The marginal tile emits `LIMIT 1 BY` the top-contribution slice per
+   bucket, because a correlated fault lights up several slices at once and each
+   surviving group is its own webhook and its own RCA run.
 2. **Cardinality budget:** a dimension is a candidate only if it has a row in
    `metric_dim_map`, and only dimensions with ≤ ~50 distinct values get one.
    `app_id` (2,000), `geo_device_id` (5,000), `advertiser_id` (500) are absent by
@@ -112,17 +120,58 @@ The RCA agent is its own `uv` project in `RCA/` — `main.py` (webhook),
   `inmobi.ad_events_enriched` for a `numbers()` subquery that fabricates the
   columns — that validates the whole CTE/window/z-test shape.
 - Pushing needs Harsh's SSH key — the sandbox has none.
+- **The webhook is a cloudflare quick tunnel, and quick tunnels get a new random
+  hostname every restart.** When the agent stops receiving, check the stored
+  webhook URL first — a dead tunnel shows up as `Failed to send webhook
+  notification` on every alert while the tiles themselves are perfectly healthy.
+  The path matters too: it must end `/webhooks/alerts` (`main.py`), not the
+  literal `/****` that was stored at one point and produced a 404 on every
+  delivery. Restarting the tunnel from some networks fails entirely — QUIC is
+  blocked and the HTTP/2 edge times out, so `--protocol http2` is not always a
+  rescue. Fallback for a demo: POST to `http://localhost:8000/webhooks/alerts`
+  directly; the alert state and the tile SQL are still the real thing, only the
+  transport is stood in for.
+- **PyPI is unreachable from the Cowork sandbox and from Docker builds** —
+  a TLS-intercepting proxy presents a CA that curl (macOS keychain) trusts and
+  Python/pip do not (`CERTIFICATE_VERIFY_FAILED: self-signed certificate in
+  certificate chain`). `uv run pytest` and `docker compose build` therefore only
+  work from Harsh's own shell, and any script that must run from either place
+  should shell out to `curl` rather than use `urllib` for HTTPS —
+  `provision_alerts.py` does exactly that, deliberately.
 - **`curl --data-binary @path` can fail to open large files in some sandboxed
   shells** (`curl: option --data-binary: error encountered when reading a file`,
   even though the file exists and is readable). `replay.sh` streams both the
   dimension CSVs and `AD_EVENTS_FILE` via stdin redirection (`--data-binary @- <
   "$file"`) instead — functionally identical, just avoids curl's own file-open
   path. Don't revert this to `@"$file"` on the sealed-dataset run.
-- **ClickStack alert message templates only support `{{title}}`/`{{body}}`/
-  `{{link}}`** — no group-by value, row column, or window timestamp (checked
-  against the ClickStack alerts docs). A per-metric `metric_id=<x>` has to be a
-  static string baked into each alert at config time, one alert per metric —
-  it cannot be templated from the firing row.
+- **The webhook *body* template supports only `{{title}}`/`{{body}}`/`{{link}}`,
+  but the alert *message* also substitutes `{{group}}` and `{{value}}`.** These
+  are two different templates and conflating them cost a design detour. The
+  message is what gets interpolated into `{{body}}`, so a grouped tile *can*
+  name the slice that fired — `scripts/provision_alerts.py` sends
+  `dimension_id={{group}} z={{value}}`. A two-column group renders as
+  `dim_name:country, dim_value:CA`, which is why `main.py::DIMENSION_ID_RE`
+  strips an optional `dim_name:` prefix. `metric_id=<x>` is still a static
+  string per alert.
+- **ClickStack's alert interval enum bottoms out at `1m`** (`1m, 5m, 15m, 30m,
+  1h, 6h, 12h, 1d`). There is no seconds option, so a compressed replay cannot
+  be alerted on at its own pace: at `bucket_seconds=2` one evaluation covers 30
+  data-hours. `metric_sql.lookback_buckets()` widens the agent's window to match,
+  because investigating a narrower window than the alert scored reports a real
+  incident as `not_reproducible`.
+- **A `line` tile alert must reference an interval macro; a `number` tile must
+  not.** Time-series alerts are rejected without `$__timeInterval`/
+  `{intervalSeconds}` (each bucket is scored independently, so the boundaries
+  have to be known). A `number` tile is only substituted with the
+  start/end pair — asking it for `{intervalSeconds}` passes validation and then
+  fails at run time with ``Substitution `intervalSeconds` is not set``. Both
+  kinds still require the window macros: no time macro at all is rejected.
+- **Tile SQL is clock-dependent.** `metric_sql._clock_exprs()` bakes the bucket,
+  hour-of-day and weekend expressions into the query text at render time, so
+  every `compress_replay.py` run leaves every saved tile scoring the previous
+  clock. Compression must always be followed by
+  `./scripts/provision_alerts.py --apply`. The agent needs nothing — it re-reads
+  `replay_clock` per query.
 
 ## Data facts worth knowing
 
@@ -137,11 +186,18 @@ The RCA agent is its own `uv` project in `RCA/` — `main.py` (webhook),
 
 ## Confirmed detections (9M rows — measured before the rebuild, re-confirm after ingest)
 
-| Day(s) | Segment | Actual | Expected | Peak z |
-|---|---|---|---|---|
-| Jun 23–25 | `os_version=Android 15` | 0.434 | 0.785 | 28.1 |
-| Jun 29–30 | `os_version=iOS 18.1` | 0.683 | 0.780 | 10.6 |
-| Jun 23–25 | global fill rate | 0.750 | 0.785 | 11.4 |
+| Day(s) | Segment | Actual | Expected | Peak z | Global tile fires? |
+|---|---|---|---|---|---|
+| Jun 23–25 | `os_version=Android 15` | 0.434 | 0.785 | 28.1 | yes (global z=11.4) |
+| Jun 29–30 | `os_version=iOS 18.1` | 0.683 | 0.780 | 10.6 | **no — 0 anomalies** |
+| Jun 23–25 | global fill rate | 0.750 | 0.785 | 11.4 | yes |
+
+The last column is why the marginal sentinel exists, and it is measured on the
+compressed replay, not argued: over the iOS 18.1 window the global `fill_rate`
+tile returns `anomaly_count = 0` while the marginal tile returns
+`os_version=iOS 18.1` at z 8.1–9.5. Global-only alerting misses that incident
+entirely — the agent's depth-1 scan would find it, but nothing would ever wake
+the agent.
 
 ## Known traps
 
@@ -168,6 +224,12 @@ The RCA agent is its own `uv` project in `RCA/` — `main.py` (webhook),
 ## Commands
 
 ```bash
+# Compressed replay, end to end. Re-runnable: compress_replay inverts a previous
+# compression via replay_clock rather than re-reading the calendar, so this whole
+# block is what to run again when the sealed dataset lands.
+./scripts/compress_replay.py --bucket-seconds 2   # 840 data-hours -> 28 min
+./scripts/provision_alerts.py --apply             # MANDATORY after any clock change
+
 ./scripts/replay.sh --schema    # DDL only
 ./scripts/replay.sh             # DDL + replay AD_EVENTS_FILE through MV1
 ./scripts/replay.sh --data      # replay only

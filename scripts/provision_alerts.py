@@ -72,26 +72,30 @@ def render(mode: str, metric_id: str | None = None) -> str:
 
 
 def alertable(env: dict) -> list[dict]:
-    """Which metrics get a tile, derived rather than listed.
+    """Which metrics get a tile — read from metric_def.alertable, not inferred.
 
-    A metric is alertable if it is drillable (has rows in metric_dim_map) or decomposable
-    (has funnel dependencies). That excludes `rpr`, which is context: nothing can be done
-    with an alert on it, because the agent has no path to investigate it. Deriving the set
-    means a new metric becomes alertable by inserting registry rows, which is the same rule
-    the rest of the system follows."""
+    Alertability is a *measured* property, not a structural one, and that distinction cost a
+    round of noise to learn. Deriving it from structure ("has dimensions or has
+    dependencies") reads plausibly and is wrong: it puts `ctr` and `render_rate` back on
+    tiles, and their separation is ~1x or worse — ctr's noisiest clean day outscores its
+    worst real incident, so the tile fires on noise by construction. The calibration lives
+    in docs/RCA_AGENT_DESIGN.md 2.2 and is recorded per row in the registry.
+
+    n_dims still comes from metric_dim_map, since it decides whether the metric also gets a
+    marginal tile. countDistinctIf, not countDistinct: an unmatched LEFT JOIN row fills a
+    String column with '' rather than NULL, so a metric with no drill path would otherwise
+    count one dimension and be given a marginal tile over nothing.
+    """
     rows = metric_query.query(
         env,
         "SELECT m.metric_id AS metric_id, "
-        "  length(m.dependencies) AS n_deps, "
-        # countDistinctIf, not countDistinct: an unmatched LEFT JOIN row fills a String
-        # column with '' rather than NULL, so a metric with no drill path would otherwise
-        # count one dimension and be given a marginal tile over nothing.
-        "  countDistinctIf(d.dim_id, d.dim_id != '') AS n_dims "
+        "  countDistinctIf(d.dim_id, d.dim_id != '') AS n_dims, "
+        "  length(m.dependencies) AS n_deps "
         "FROM inmobi.metric_def m FINAL "
         "LEFT JOIN (SELECT metric_id, dim_id FROM inmobi.metric_dim_map FINAL) d "
         "  ON d.metric_id = m.metric_id AND NOT has(m.invalid_dims, d.dim_id) "
+        "WHERE m.alertable = 1 "
         "GROUP BY metric_id, n_deps "
-        "HAVING n_dims > 0 OR n_deps > 0 "
         "ORDER BY n_deps DESC, metric_id FORMAT JSONEachRow",
     )
     return [

@@ -232,11 +232,24 @@ async def scan_dims(
     ]
     if not eligible:
         return []
-    # a dimension_id on the alert is a hint about where to look, never evidence: it only
-    # narrows the first scan, and an empty result falls straight back to the full sweep.
-    if first_dim in eligible:
-        first_pass = await _scan(metric_id, [first_dim], start, end)
-        return first_pass or await _scan(metric_id, eligible, start, end)
+    # Always the full sweep, even when the alert named a dimension.
+    #
+    # This used to scan the hinted dimension alone and only fall back to the full sweep if
+    # that came back empty. It was cheap and it was wrong: with a hint the ladder returned a
+    # single candidate and an EMPTY ruled_out list, because `_investigate_factor` can only
+    # clear what the scan enumerated. That breaks CLAUDE.md rule 6 and deletes exactly the
+    # evidence the brief asks for as its bonus criterion — what was checked and cleared.
+    # Measured side by side on the Android 15 incident: unhinted named the culprit and
+    # cleared publisher_tier, region, ad_format and two device_models; hinted named the same
+    # culprit and cleared nothing.
+    #
+    # The saving was never real anyway — the fan-out is one ARRAY JOIN pass whether it covers
+    # one dimension or all seven. The hint is kept as provenance on the ledger (what the alert
+    # claimed) rather than as a scan modifier, so nothing about the verdict depends on the
+    # wire being right.
+    # ponytail: no ordering tweak either — ranking stays purely by contribution, since
+    # promoting a hinted slice above a higher-contribution one is the exact failure
+    # "rank by contribution, not percentage change" exists to prevent.
     return await _scan(metric_id, eligible, start, end)
 
 

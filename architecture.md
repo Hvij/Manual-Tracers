@@ -48,10 +48,15 @@ flowchart TB
 
     subgraph L3["3 · HyperDX / ClickStack — detection"]
         direction TB
-        Chart["chart per alertable metric<br/>runs the rendered query on the ALL bucket"]:::obs
-        Gate{"threshold<br/>above_exclusive 0"}:::gate
+        Glob["global tile · per alertable metric<br/>the ALL bucket — did the metric move?"]:::obs
+        Marg["marginal tile · per metric with dims<br/>62 depth-1 slices, one ARRAY JOIN pass<br/>grouped: HyperDX alerts each slice alone"]:::obs
+        Fresh["freshness tile<br/>every other alert goes SILENT when ingest dies"]:::obs
+        Gate{"above_exclusive 0<br/>(freshness: above 1 window)"}:::gate
         Hook["webhook dispatcher"]:::obs
-        Chart --> Gate -->|breach| Hook
+        Glob --> Gate
+        Marg --> Gate
+        Fresh --> Gate
+        Gate -->|breach| Hook
     end
 
     subgraph L4["4 · RCA agent — RCA/app/"]
@@ -87,9 +92,9 @@ flowchart TB
 
     Events --> Bronze
     L2 --> Builder
-    Builder -->|"rendered with now()-relative bounds"| Chart
+    Builder -->|"rendered by provision_alerts.py<br/>bounds from the tile's window macros"| Glob
     Builder -.->|"rendered with bound parameters"| L4
-    Hook -->|"body: metric_id=x, optionally dimension_id=y"| Recv
+    Hook -->|"body: metric_id=x scope=… dimension_id={{group}}"| Recv
     Ledger --> Prompt
     Ground -->|"yes"| Out
     Fall --> Out
@@ -107,7 +112,9 @@ flowchart TB
 | `ad_events` → `ad_events_enriched` | `sql/01_schema.sql`, `sql/03_silver.sql` (`mv_ad_events_enriched`) |
 | `metric_def` | `sql/04_semantic_layer.sql` §4.1 |
 | `metric_dim_map` | `sql/04_semantic_layer.sql` §4.2 |
-| `metric_sql.deviation_sql` | `RCA/app/metric_sql.py`; rendered for HyperDX by `scripts/metric_query.py alert <metric>` |
+| `metric_sql.deviation_sql` | `RCA/app/metric_sql.py`; rendered for HyperDX by `scripts/metric_query.py {alert,marginal,scan}` |
+| global / marginal / freshness tiles | `scripts/provision_alerts.py --apply` — renders all of them from the registry and pushes dashboard + alerts |
+| `replay_clock` | `sql/04_semantic_layer.sql` §4.3; rewritten by `scripts/compress_replay.py`, read live by both renderers |
 | Steps 1–5 | `RCA/app/investigate.py` — `reproduce_global`, `decompose`, `scan_dims`, `holdout_check`, `cross_check` |
 | ledger | the dict `run_investigation` returns; also the Langfuse trace payload |
 
@@ -160,21 +167,28 @@ platform limits, found during implementation, move where those land:
    `scripts/metric_query.py alert <metric>` prints exactly what to paste, read
    live from the registry, so a threshold change is a registry `INSERT` and a
    re-paste rather than a code change.
-2. **The webhook body template only supports `{{title}}`/`{{body}}`/
-   `{{link}}`** — no group-by value, row column or window timestamp. `metric_id`
-   must therefore be a static string baked into each alert's message at config
-   time, one alert per alertable metric. The receiver parses
-   `metric_id=<x>` and, when present, `dimension_id=<y>` — so an alerting source
-   that *can* name a segment is a config change rather than a code change — but
-   ClickStack cannot currently produce the second field.
+2. **The webhook *body* template supports only `{{title}}`/`{{body}}`/
+   `{{link}}` — but the alert *message* also substitutes `{{group}}` and
+   `{{value}}`.** These are two different templates, and conflating them is what
+   produced the earlier (wrong) claim in this document that a segment could never
+   be named on the wire. The message is interpolated into `{{body}}`, so a
+   grouped tile does report the slice that fired. `metric_id` is still a static
+   string per alert; `dimension_id={{group}}` is templated. A two-column group
+   renders as `dim_name:country, dim_value:CA`, so `main.py::DIMENSION_ID_RE`
+   strips the optional `dim_name:` prefix to recover the dimension id.
 
-Constraint 2 turned out to be an improvement in disguise: because the agent can
-trust *nothing* from the wire, it re-derives the window, the trigger and every
-candidate live. `dimension_id` is treated as a hint only — it narrows the first
-dimension scan and, if the global series did not move, points Step 1 at the
-series the alert named. Every number in the ledger still comes from a query the
-agent issued itself, so a stale or duplicated webhook cannot poison the
-diagnosis.
+3. **The alert interval enum bottoms out at `1m`,** and a `line` tile alert is
+   rejected unless its SQL references an interval macro while a `number` tile is
+   never substituted with one. Both shapes still require the window macros. This
+   is why the marginal tile rolls up to `$__timeInterval(ts)` and the freshness
+   tile divides by `end - start` rather than by `{intervalSeconds}`.
+
+None of this loosens the trust boundary: the agent re-derives the window, the
+trigger and every candidate live. `dimension_id` is a hint only — it narrows the
+first dimension scan, and an id that fails the registry whitelist in `_dim_col`
+simply widens the scan back to the full sweep. Every number in the ledger comes
+from a query the agent issued itself, so a stale, duplicated or mis-templated
+webhook cannot poison the diagnosis.
 
 ## Step-by-Step Execution Flow
 
@@ -209,9 +223,32 @@ things render it: the RCA agent (with bound parameters) and
 `scripts/metric_query.py` (with `now()`-relative bounds, for HyperDX). They
 cannot drift apart, because there is nothing to keep in sync.
 
-One ClickStack chart per alertable metric (`fill_rate`, `requests`, `ecpm`,
-`revenue`) runs that query on the `ALL` bucket and returns `anomalies` per hour.
-One alert per chart fires the webhook with a static `metric_id=<x>` in the body.
+Three kinds of tile, all rendered from that one builder by
+`scripts/provision_alerts.py`, which reads the alertable set from the registry
+rather than listing it — a metric qualifies if it is drillable (has
+`metric_dim_map` rows) or decomposable (has `dependencies`), which is what keeps
+`rpr` out:
+
+| Tile | Shape | Asks |
+|---|---|---|
+| **global** (one per alertable metric) | `number` | did the metric itself move? |
+| **marginal** (one per metric with dims) | `line`, grouped on `dim_name`/`dim_value` | did any depth-1 slice move, even if the global series did not? |
+| **freshness** (one, total) | `number` | is data still arriving? |
+
+The marginal tile exists because global-only alerting has a measured blind spot:
+the planted `os_version=iOS 18.1` fault scores **0 anomalies on the global
+`fill_rate` tile** and 8.1–9.5 on the marginal one. HyperDX alerts each group
+independently, so all 62 depth-1 slices are watched by one query — the same
+`ARRAY JOIN` fan-out `scan_dims` uses, never the 767,984-combination
+cross-product. `LIMIT 1 BY` keeps the top-contribution slice per bucket, so a
+correlated fault is one webhook rather than five.
+
+The freshness tile is the only one that fires when ingest stops. Every deviation
+alert goes *silent* in that case — no rows means no anomalies — and silence is
+indistinguishable from health.
+
+Each alert fires the webhook with a static `metric_id=<x> scope=<global|marginal>`
+plus, on marginal tiles, a templated `dimension_id={{group}} z={{value}}`.
 
 ### 3. Automated Drill-Down (Investigation Engine)
 
@@ -227,9 +264,27 @@ tool; every query is parameterised.
 from silver over the live window (24h back from `max(event_time)`, so a
 bulk-replayed file still investigates the current window and not the tail of the
 file) and keeps the anomalous hours. It is the same rendered query the alert ran,
-not a stored result read back. If nothing is anomalous any more, the verdict is
-`not_reproducible` and the ladder stops. Nothing in the alert body is ever taken
-as proof the anomaly is real.
+not a stored result read back. Nothing in the alert body is ever taken as proof
+the anomaly is real.
+
+The window is 24 **data-hours**, widened by `metric_sql.lookback_buckets()` to at
+least one alert evaluation — under a compressed replay a single 1-minute
+evaluation spans 30 data-hours, and reproducing a narrower window than the alert
+scored would drop the very anomaly that fired it. Every span in the ladder is
+counted in data-hours and converted through `replay_clock`; a literal
+`timedelta(hours=24)` is correct only at real time and otherwise reaches past the
+whole dataset.
+
+If the global series is clean, the ladder does **not** stop — it falls through to
+`_investigate_marginal`, which re-scores the depth-1 slices before giving up.
+That branch is what makes the marginal sentinel useful: an incident too small to
+move the global metric arrives with a clean global series by construction, and
+returning `not_reproducible` there would drop exactly the incidents the sentinel
+was added to catch. The ledger records `scope: marginal`, and the holdout in that
+branch is deliberately read as weak evidence — removing a culprit from a
+population already at baseline trivially leaves a residual at baseline, so the
+load-bearing evidence is the slice's own z and contribution. Only when both
+global and marginal come back clean is the verdict `not_reproducible`.
 
 **Step 2 — Decompose** (any metric whose `metric_def.dependencies` is non-empty,
 i.e. `revenue`). Walks the funnel identity *before* touching any dimension, via a
@@ -329,13 +384,16 @@ lost to an early process exit. **No trace, no credit.**
 
 ## The rule that makes this scale
 
-**Alert on the global series. Enumerate marginals at drill time. Never touch the
+**Alert on the global series and on the marginals. Never touch the
 cross-product.**
 
 The full dimension cross-product is 767,984 combinations on 9M rows — measured,
 not estimated. Nothing in this system enumerates it, at any stage:
 
-- **Alerting** reads one series per metric: `dim_name = 'ALL'`.
+- **Alerting** reads two series per metric: the `ALL` bucket, and the 62 depth-1
+  marginals in one `ARRAY JOIN` pass. The earlier design alerted on `ALL` only;
+  that is what let `os_version=iOS 18.1` through, since it never moved the global
+  number. Adding the marginals costs one extra query per metric, not 62.
 - **Depth 1** enumerates 62 marginal slices, exhaustively, in one pass. Marginals
   are linear in the number of dimensions; the cube is multiplicative. That is the
   whole trick.
