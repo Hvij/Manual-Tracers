@@ -8,10 +8,21 @@
 #   ./scripts/replay.sh --data       replay data only, no DDL
 #   ./scripts/replay.sh --dims       also reload the 3 dimension CSVs
 #   ./scripts/replay.sh --rebuild-silver  re-apply schema + JOIN-backfill silver
+#   ./scripts/replay.sh --sealed     the whole sealed-dataset pipeline in one shot:
+#                                    truncate ad_events(_enriched) only, replace
+#                                    apps/advertisers/geo_device with SEALED_DIM_DIR,
+#                                    replay AD_EVENTS_FILE + SEALED_EVENTS_FILES[]
+#                                    (same shift, so the sealed slice lands right
+#                                    after the main dataset's tail — no gap, one
+#                                    consistent dim taxonomy across the whole
+#                                    timeline), then compress_replay.py and
+#                                    provision_alerts.py --apply. Re-runnable: this
+#                                    is what to run again each time the sealed
+#                                    dataset changes or the demo pace gets retuned.
 #
-# ON SEALED-DATA NIGHT: change AD_EVENTS_FILE below to the jury's file,
+# For any OTHER dataset swap: change AD_EVENTS_FILE below to the new file,
 # truncate manually (see TRUNCATE HELPER at the bottom), then run.
-# This script never truncates by itself.
+# Only --sealed truncates on its own; every other mode never does.
 # ---------------------------------------------------------------------
 
 set -euo pipefail
@@ -35,6 +46,26 @@ AD_EVENTS_FILE="InMobi/data/ad_events.parquet"
 # 6 puts the 2026-07-05 tail of the shipped file at ~2026-08-16 (2 weeks of
 # future headroom past today, 2026-08-02).
 TIME_SHIFT_WEEKS=6
+# =====================================================================
+
+# ===================== --sealed mode config ===========================
+# Sealed dims carry the SAME ID space as the main dataset (spec.md) but
+# regenerated attribute values, so they REPLACE apps/advertisers/geo_device
+# rather than append — appending would give every id two rows and fan out
+# the enrichment JOIN (measured once: 9M rows became 19.6M). One dim set is
+# used for the whole replayed timeline, main dataset included.
+SEALED_DIM_DIR="click-a-thon-2026/InMobi/unseen_data"
+
+# Extra event file(s) appended after AD_EVENTS_FILE, same TIME_SHIFT_WEEKS,
+# so the sealed slice is contiguous with the main dataset's tail — that
+# contiguity is what gives the sealed incident window a real trailing
+# baseline (RCA/app/metric_sql.py HISTORY_WEEKS) instead of ~5 days alone.
+SEALED_EVENTS_FILES=(
+  "click-a-thon-2026/InMobi/unseen_data/ad_events.parquet"
+)
+
+# compress_replay.py bucket size used at the end of --sealed.
+COMPRESS_BUCKET_SECONDS=2
 # =====================================================================
 
 DIM_DIR="InMobi/data"
@@ -110,15 +141,43 @@ apply_sql_file() {
 }
 
 MODE="${1:-all}"
-DO_SCHEMA=1; DO_DATA=1; DO_DIMS=0; DO_REBUILD_SILVER=0
+DO_SCHEMA=1; DO_DATA=1; DO_DIMS=0; DO_REBUILD_SILVER=0; DO_SEALED=0
 case "$MODE" in
   --schema) DO_DATA=0 ;;
   --data)   DO_SCHEMA=0 ;;
   --dims)   DO_DIMS=1 ;;
   --rebuild-silver) DO_SCHEMA=1; DO_DATA=0; DO_REBUILD_SILVER=1 ;;
+  --sealed) DO_DATA=0; DO_SEALED=1 ;;
   all|"")   ;;
   *) die "unknown mode: $MODE" ;;
 esac
+
+# Shift-load one Parquet file into ad_events. input() transforms on ingest, so
+# the shift costs one pass and no staging table. Column list must match the
+# parquet schema exactly. Shared by --data (single AD_EVENTS_FILE) and
+# --sealed (AD_EVENTS_FILE + SEALED_EVENTS_FILES[]) so the shift math lives
+# in exactly one place.
+load_events_shifted() {
+  local file="$1"
+  [[ -f "$file" ]] || die "input file not found: $file"
+  if [[ "$TIME_SHIFT_WEEKS" -eq 0 ]]; then
+    ch_load ad_events "$file" Parquet
+    return
+  fi
+  echo "   shifting event_time by +${TIME_SHIFT_WEEKS} week(s): ${file}"
+  local schema='event_time DateTime64(3), app_id String, geo_device_id String,
+          advertiser_id String, ad_format String, is_filled UInt8,
+          is_impression UInt8, is_click UInt8, revenue Float64'
+  local q="INSERT INTO ${DB}.ad_events
+     SELECT event_time + INTERVAL ${TIME_SHIFT_WEEKS} WEEK,
+            app_id, geo_device_id, advertiser_id, ad_format,
+            is_filled, is_impression, is_click, revenue
+     FROM input('${schema}') FORMAT Parquet"
+  local enc; enc=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$q")
+  local out
+  out=$(curl -sS --fail-with-body -u "$AUTH" "${URL}/?query=${enc}" \
+          --data-binary @- < "$file" 2>&1) || die "shifted load of $file failed: ${out}"
+}
 
 log "target ${URL} · db=${DB}"
 ch_sql "SELECT 1" >/dev/null && echo "   connection OK"
@@ -166,25 +225,37 @@ if (( DO_DATA )); then
   log "replaying ${AD_EVENTS_FILE}"
   echo "   MV1 will populate ad_events_enriched on insert"
   START=$(date +%s)
+  load_events_shifted "$AD_EVENTS_FILE"
+  echo "   done in $(( $(date +%s) - START ))s"
+fi
 
-  if [[ "$TIME_SHIFT_WEEKS" -eq 0 ]]; then
-    ch_load ad_events "$AD_EVENTS_FILE" Parquet
-  else
-    # input() transforms on ingest, so the shift costs one pass and no
-    # staging table. Column list must match the parquet schema exactly.
-    echo "   shifting event_time by +${TIME_SHIFT_WEEKS} week(s)"
-    SCHEMA='event_time DateTime64(3), app_id String, geo_device_id String,
-            advertiser_id String, ad_format String, is_filled UInt8,
-            is_impression UInt8, is_click UInt8, revenue Float64'
-    Q="INSERT INTO ${DB}.ad_events
-       SELECT event_time + INTERVAL ${TIME_SHIFT_WEEKS} WEEK,
-              app_id, geo_device_id, advertiser_id, ad_format,
-              is_filled, is_impression, is_click, revenue
-       FROM input('${SCHEMA}') FORMAT Parquet"
-    ENC=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))' "$Q")
-    OUT=$(curl -sS --fail-with-body -u "$AUTH" "${URL}/?query=${ENC}" \
-            --data-binary @- < "$AD_EVENTS_FILE" 2>&1) || die "shifted load failed: ${OUT}"
-  fi
+# ---------------------------------------------------------------- sealed
+# The whole sealed-dataset pipeline: truncate event tables only (dims are
+# handled separately below since they REPLACE, not append), replay main +
+# sealed files back to back under one dim set, then compress + provision.
+if (( DO_SEALED )); then
+  log "sealed refresh: truncating ad_events + ad_events_enriched"
+  ch_sql "TRUNCATE TABLE ${DB}.ad_events" >/dev/null
+  ch_sql "TRUNCATE TABLE ${DB}.ad_events_enriched" >/dev/null
+  echo "   event tables empty (dimension tables untouched so far)"
+
+  log "loading sealed dims from ${SEALED_DIM_DIR} (replaces apps/advertisers/geo_device)"
+  ch_sql "TRUNCATE TABLE ${DB}.apps" >/dev/null
+  ch_sql "TRUNCATE TABLE ${DB}.advertisers" >/dev/null
+  ch_sql "TRUNCATE TABLE ${DB}.geo_device" >/dev/null
+  CSV_OPTS="&input_format_with_names_use_header=1"
+  ch_load apps        "${SEALED_DIM_DIR}/apps.csv"        CSVWithNames "$CSV_OPTS"
+  ch_load advertisers "${SEALED_DIM_DIR}/advertisers.csv" CSVWithNames "$CSV_OPTS"
+  ch_load geo_device  "${SEALED_DIM_DIR}/geo_device.csv"  CSVWithNames "$CSV_OPTS"
+  reload_dicts
+  echo "   sealed dims + dictionaries loaded"
+
+  log "replaying ${AD_EVENTS_FILE} + ${#SEALED_EVENTS_FILES[@]} sealed file(s), shifted +${TIME_SHIFT_WEEKS}w"
+  START=$(date +%s)
+  load_events_shifted "$AD_EVENTS_FILE"
+  for f in "${SEALED_EVENTS_FILES[@]}"; do
+    load_events_shifted "$f"
+  done
   echo "   done in $(( $(date +%s) - START ))s"
 fi
 
@@ -249,11 +320,29 @@ for m in fill_rate requests ecpm revenue; do
   ch_sql "${SCAN} FORMAT PrettyCompactMonoBlock"
 done
 
+# ------------------------------------------------- compress + provision
+# Only --sealed does this automatically: compression is destructive to the
+# uncompressed timeline (rewrites every event_time) and re-provisioning
+# replaces the live dashboard, so every other mode leaves both alone.
+if (( DO_SEALED )); then
+  log "compressing replay (bucket_seconds=${COMPRESS_BUCKET_SECONDS})"
+  "$PY" scripts/compress_replay.py --bucket-seconds "$COMPRESS_BUCKET_SECONDS"
+
+  log "provisioning dashboard + alerts"
+  if ! "$PY" scripts/provision_alerts.py --apply; then
+    echo "   --apply needs CLICKHOUSE_CLOUD_KEY_ID/_SECRET in .env — spec was"
+    echo "   still rendered to docs/rca_detection_dashboard.json; push it"
+    echo "   through the ClickStack MCP instead (see provision_alerts.py)."
+  fi
+fi
+
 log "done"
 
 # =====================================================================
-# TRUNCATE HELPER — deliberately NOT run by this script.
-# Paste manually before replaying a different dataset:
+# TRUNCATE HELPER — deliberately NOT run by --schema/--data/--dims/
+# --rebuild-silver. --sealed truncates ad_events(_enriched) itself (see
+# above) since that mode exists specifically to be re-run.
+# Paste manually before replaying a different dataset some other way:
 #
 #   TRUNCATE TABLE inmobi.ad_events;
 #   TRUNCATE TABLE inmobi.ad_events_enriched;
