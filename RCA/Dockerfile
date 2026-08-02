@@ -4,10 +4,18 @@
 FROM python:3.13-slim
 WORKDIR /repo
 
-RUN pip install --no-cache-dir uv
+# Corporate networks often MITM PyPI with a private CA; match rca-api/rca-ui npm workaround.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir uv \
+         --trusted-host pypi.org \
+         --trusted-host files.pythonhosted.org
 
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev \
+    --allow-insecure-host pypi.org \
+    --allow-insecure-host files.pythonhosted.org
 
 COPY RCA ./RCA
 

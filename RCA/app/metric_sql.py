@@ -14,8 +14,16 @@ lookback cannot inflate the band and mask itself.
 """
 
 HISTORY_WEEKS = 10  # enough for 20 same-hour, same-day-type points on weekends too
+HISTORY_BUCKETS = HISTORY_WEEKS * 7 * 24  # the same span counted in data-hours
 BASELINE_POINTS = 20
 MIN_BASE_POINTS = 8  # below this the baseline is not worth scoring against
+
+# ClickStack's shortest alert evaluation interval (the `interval` enum bottoms out at 1m).
+# It matters here because one such interval can span many data-hours under a compressed
+# replay, and the agent's investigation window has to be at least as wide as the window the
+# alert evaluated — otherwise the anomaly that fired the alert sits outside the window the
+# agent reproduces, and a real incident reports as not_reproducible.
+MIN_ALERT_INTERVAL_S = 60
 
 # A "bucket" is one data-hour. In real time that is 3600 wall-clock seconds; in a
 # compressed replay (scripts/compress_replay.py) it is fewer, so 35 days of history can
@@ -57,8 +65,23 @@ def bucket_seconds(clock: dict | None) -> int:
 
 def window_seconds(buckets: int, clock: dict | None) -> int:
     """Convert a span expressed in data-hours into wall-clock seconds under this clock.
-    A 24-data-hour lookback is 24h of real time, but only 24s at 1 bucket/second."""
+    A 24-data-hour lookback is 24h of real time, but only 24s at 1 bucket/second.
+
+    Every lookback in this system is authored in data-hours and converted here. Writing one
+    directly as a real-time interval (INTERVAL 24 HOUR, timedelta(hours=24)) is the bug this
+    exists to prevent: compressed, that reaches past the whole dataset and the "last 24
+    hours" silently becomes all 35 days."""
     return buckets * bucket_seconds(clock)
+
+
+def lookback_buckets(clock: dict | None, default_buckets: int = 24) -> int:
+    """How many data-hours the agent should reproduce for one alert.
+
+    At real time an alert interval is minutes and the 24-data-hour default dominates.
+    Compressed, a single 1-minute evaluation can cover 60 data-hours, so the default would
+    be narrower than what the alert actually looked at."""
+    per_interval = -(-MIN_ALERT_INTERVAL_S // bucket_seconds(clock))  # ceil division
+    return max(default_buckets, per_interval)
 
 
 def dim_tuples(dims: list[str]) -> str:

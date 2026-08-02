@@ -1,11 +1,9 @@
 -- =====================================================================
--- 02 · DICTIONARIES — dimension lookup for the enrichment MV
+-- 02 · DICTIONARIES — optional lookup cache (not used by the silver MV)
 -- =====================================================================
--- Why dictionaries and not JOIN:
---   A materialized view fires per inserted block. A JOIN inside an MV
---   re-reads the right-hand table for every block and is not guaranteed
---   to see a consistent snapshot. dictGet is an in-memory hash probe,
---   deterministic and O(1), which is what we want on the ingest path.
+-- The silver MV (03_silver.sql) JOINs dim tables directly at ingest.
+-- These dictionaries remain for ad-hoc dictGet probes and tooling; reload
+-- them after a dim CSV load via replay.sh (SYSTEM RELOAD DICTIONARY).
 -- Keys are String, so COMPLEX_KEY_HASHED (HASHED requires UInt64 keys).
 -- LIFETIME(0) = never auto-reload; we reload explicitly after a dim load.
 

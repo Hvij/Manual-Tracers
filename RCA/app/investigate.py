@@ -31,23 +31,30 @@ async def _dim_col(dim_name: str) -> str:
     return dim_name
 
 
-def _window_params(start, end) -> dict:
-    """The baseline needs history the investigation window itself does not cover."""
+def _window_params(start, end, clock: dict) -> dict:
+    """The baseline needs history the investigation window itself does not cover.
+
+    The history span is authored in data-hours and converted through the clock, never
+    written as timedelta(weeks=...) — under a compressed replay a real-time week bears no
+    relation to a data week. See metric_sql.window_seconds."""
     return {
-        "hist_start": end - timedelta(weeks=metric_sql.HISTORY_WEEKS),
+        "hist_start": end
+        - timedelta(
+            seconds=metric_sql.window_seconds(metric_sql.HISTORY_BUCKETS, clock)
+        ),
         "start": start,
         "end": end,
     }
 
 
-async def _deviation(meta: dict, dims: list[str]) -> str:
+async def _deviation(meta: dict, dims: list[str], clock: dict) -> str:
     return metric_sql.deviation_sql(
         meta,
         dims,
         hist_start="{hist_start:DateTime}",
         start="{start:DateTime}",
         end="{end:DateTime}",
-        clock=await get_clock(),
+        clock=clock,
     )
 
 
@@ -70,10 +77,11 @@ async def reproduce_global(metric_id: str, start, end) -> list[dict]:
     """The global hourly series, scored. Computed live from silver — there is no stored
     deviation series to trust, and nothing on the alert wire is taken as proof."""
     meta = await get_metric(metric_id)
-    deviation = await _deviation(meta, ["ALL"])
+    clock = await get_clock()
+    deviation = await _deviation(meta, ["ALL"], clock)
     return await query_rows(
         f"SELECT ts, actual, expected, z_score, delta_rel, is_anomaly FROM ({deviation}) ORDER BY ts",
-        _window_params(start, end),
+        _window_params(start, end, clock),
     )
 
 
@@ -85,16 +93,34 @@ async def reproduce_segment(metric_id: str, dim_name: str, start, end) -> list[d
     every other externally-reachable dimension reference before it is spliced into SQL."""
     meta = await get_metric(metric_id)
     col = await _dim_col(dim_name)
-    deviation = await _deviation(meta, [col])
+    clock = await get_clock()
+    deviation = await _deviation(meta, [col], clock)
     return await query_rows(
         f"SELECT ts, dim_value, actual, expected, z_score, delta_rel, is_anomaly "
         f"FROM ({deviation}) ORDER BY dim_value, ts",
-        _window_params(start, end),
+        _window_params(start, end, clock),
     )
 
 
 def _anomalous(rows: list[dict]) -> list[dict]:
     return [r for r in rows if r["is_anomaly"]]
+
+
+def _scorable(rows: list[dict]) -> list[dict]:
+    """Buckets that have a baseline behind them at all.
+
+    A bucket inside the MIN_BASE_POINTS warm-up carries NULL/NaN expected and z_score. The
+    anomalous path never sees those (is_anomaly requires a real z), but the marginal fallback
+    summarises the *un*-anomalous global series, where they are the majority early in a
+    replay — and mean()/max() over a NULL is a crash, not a zero."""
+    return [
+        r
+        for r in rows
+        if r["expected"] is not None
+        and r["z_score"] is not None
+        and math.isfinite(r["expected"])
+        and math.isfinite(r["z_score"])
+    ]
 
 
 def _mean_actual_expected(rows: list[dict]) -> tuple[float, float] | None:
@@ -219,7 +245,8 @@ async def _scan(metric_id: str, dims: list[str], start, end) -> list[dict]:
     deviation query, so 62 depth-1 slices cost one pass over silver, not 62.
     Ranked by contribution — Σ |delta_abs| × sample_count — never by percentage change."""
     meta = await get_metric(metric_id)
-    deviation = await _deviation(meta, dims)
+    clock = await get_clock()
+    deviation = await _deviation(meta, dims, clock)
     return await query_rows(
         "SELECT dim_name, dim_value, count() AS anomalous_hours, "
         "max(abs(z_score)) AS peak_abs_z, avg(actual) AS avg_actual, "
@@ -227,7 +254,7 @@ async def _scan(metric_id: str, dims: list[str], start, end) -> list[dict]:
         "sum(abs(delta_abs) * sample_count) AS contribution "
         f"FROM ({deviation}) WHERE is_anomaly = 1 "
         "GROUP BY dim_name, dim_value ORDER BY contribution DESC",
-        _window_params(start, end),
+        _window_params(start, end, clock),
     )
 
 
@@ -420,6 +447,12 @@ async def _investigate_factor(
 
     top = candidates[0]
     parent = {"dim_name": top["dim_name"], "dim_value": top["dim_value"]}
+    # No global summary means the whole window is inside the baseline warm-up, which happens
+    # early in a compressed replay. The candidate's own seasonal expectation is then the only
+    # reference the holdout residual can be measured against.
+    expected_ref = (
+        global_summary["expected"] if global_summary else top["avg_expected"]
+    )
 
     # independent of each other — the dependency walk conditions on parent, not on holdout —
     # so run both concurrently rather than paying two round trips back to back
@@ -428,11 +461,11 @@ async def _investigate_factor(
             target_metric,
             [parent],
             top["avg_actual"] - top["avg_expected"],
-            global_summary["expected"],
+            expected_ref,
             start,
             end,
         ),
-        cross_check(target_metric, parent, global_summary["expected"], start, end),
+        cross_check(target_metric, parent, expected_ref, start, end),
     )
 
     verdict = holdout["verdict"]
@@ -454,6 +487,53 @@ async def _investigate_factor(
     }
 
 
+@traced("investigate_marginal")
+async def _investigate_marginal(
+    metric_id: str, dimension_id: str | None, global_rows: list[dict], start, end, window
+) -> dict:
+    """Step 1 fallback: the global series is clean, so score the depth-1 slices before giving up.
+
+    The marginal sentinel tile alerts on all 62 slices independently, so an incident confined
+    to a segment too small to move the global metric can only reach the agent this way.
+    Returning not_reproducible on a clean global — which is what this function replaces —
+    dropped exactly those incidents on the floor.
+
+    Nothing from the alert is trusted here either: the slices are re-scored live from silver,
+    the same query the global path runs, only fanned out.
+    """
+    candidates = await scan_dims(metric_id, start, end, dimension_id)
+    scorable = _scorable(global_rows)
+    global_summary = _global_summary(scorable) if scorable else None
+
+    if not candidates:
+        return {
+            "metric_id": metric_id,
+            "window": window,
+            "scope": "global",
+            "global": global_summary,
+            "verdict": "not_reproducible",
+        }
+
+    finding = await _investigate_factor(
+        metric_id, global_summary, start, end, dimension_id
+    )
+    # The holdout is near-vacuous in this branch and must not be read as strong evidence:
+    # removing the culprit from a population that was already at baseline trivially leaves a
+    # residual at baseline. The load-bearing evidence is the slice's own z and contribution,
+    # plus the dependency walk. scope=marginal is what tells the narrator to say the global
+    # metric did not move.
+    return {
+        "metric_id": metric_id,
+        "window": window,
+        "scope": "marginal",
+        "dimension_id": dimension_id,
+        "global": global_summary,
+        "decomposition": None,
+        "findings": [finding],
+        "verdict": finding["verdict"],
+    }
+
+
 @traced("run_investigation")
 async def run_investigation(
     metric_id: str, dimension_id: str | None = None, lookback_hours: int = 24
@@ -462,15 +542,25 @@ async def run_investigation(
     if meta is None:
         return {"metric_id": metric_id, "verdict": "unknown_metric"}
 
+    # lookback_hours is data-hours, not wall-clock hours, and the two diverge under a
+    # compressed replay. lookback_buckets also widens it to cover one alert evaluation, which
+    # can span many data-hours when compressed — investigating a narrower window than the
+    # alert scored would report a real incident as not_reproducible.
+    clock = await get_clock()
+    buckets = metric_sql.lookback_buckets(clock, lookback_hours)
     max_ts = await get_max_ts()
-    start, end = max_ts - timedelta(hours=lookback_hours), max_ts
-    window = {"start": start.isoformat(), "end": end.isoformat()}
+    start = max_ts - timedelta(seconds=metric_sql.window_seconds(buckets, clock))
+    end = max_ts
+    window = {"start": start.isoformat(), "end": end.isoformat(), "buckets": buckets}
 
     # dimension_id from the alert is only ever a scan-priority hint (see scan_dims). The
     # global series is what has to reproduce, and it is recomputed here, not read back.
-    anomalous = _anomalous(await reproduce_global(metric_id, start, end))
+    global_rows = await reproduce_global(metric_id, start, end)
+    anomalous = _anomalous(global_rows)
     if not anomalous:
-        return {"metric_id": metric_id, "window": window, "verdict": "not_reproducible"}
+        return await _investigate_marginal(
+            metric_id, dimension_id, global_rows, start, end, window
+        )
 
     decomposition = None
     if meta["dependencies"]:
@@ -512,6 +602,7 @@ async def run_investigation(
     return {
         "metric_id": metric_id,
         "window": window,
+        "scope": "global",
         "dimension_id": dimension_id,
         "decomposition": decomposition,
         "findings": list(findings),

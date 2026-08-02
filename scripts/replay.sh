@@ -7,6 +7,7 @@
 #   ./scripts/replay.sh --schema     apply SQL only, no data
 #   ./scripts/replay.sh --data       replay data only, no DDL
 #   ./scripts/replay.sh --dims       also reload the 3 dimension CSVs
+#   ./scripts/replay.sh --rebuild-silver  re-apply schema + JOIN-backfill silver
 #
 # ON SEALED-DATA NIGHT: change AD_EVENTS_FILE below to the jury's file,
 # truncate manually (see TRUNCATE HELPER at the bottom), then run.
@@ -109,11 +110,12 @@ apply_sql_file() {
 }
 
 MODE="${1:-all}"
-DO_SCHEMA=1; DO_DATA=1; DO_DIMS=0
+DO_SCHEMA=1; DO_DATA=1; DO_DIMS=0; DO_REBUILD_SILVER=0
 case "$MODE" in
   --schema) DO_DATA=0 ;;
   --data)   DO_SCHEMA=0 ;;
   --dims)   DO_DIMS=1 ;;
+  --rebuild-silver) DO_SCHEMA=1; DO_DATA=0; DO_REBUILD_SILVER=1 ;;
   all|"")   ;;
   *) die "unknown mode: $MODE" ;;
 esac
@@ -138,16 +140,29 @@ if (( DO_DIMS )) || [[ "$APPS_N" == "0" ]]; then
   ch_load apps        "${DIM_DIR}/apps.csv"        CSVWithNames "$CSV_OPTS"
   ch_load advertisers "${DIM_DIR}/advertisers.csv" CSVWithNames "$CSV_OPTS"
   ch_load geo_device  "${DIM_DIR}/geo_device.csv"  CSVWithNames "$CSV_OPTS"
+  echo "   dims loaded"
+else
+  echo "   dimensions already present (${APPS_N} apps) — skipping CSV reload"
+fi
+
+# Dictionaries must reflect dim tables before any ad_events ingest (MV uses
+# JOIN now, but reload is cheap insurance for dictGet tooling).
+reload_dicts() {
   for d in dict_apps dict_advertisers dict_geo_device; do
     ch_sql "SYSTEM RELOAD DICTIONARY ${DB}.${d}" >/dev/null
   done
-  echo "   dims loaded and dictionaries reloaded"
-else
-  echo "   dimensions already present (${APPS_N} apps) — skipping"
+}
+if (( DO_DIMS )) || [[ "$APPS_N" == "0" ]]; then
+  reload_dicts
+  echo "   dictionaries reloaded"
 fi
 
 # --------------------------------------------------------------- data
 if (( DO_DATA )); then
+  APPS_N=$(ch_sql "SELECT count() FROM ${DB}.apps" | tr -d '[:space:]')
+  [[ "$APPS_N" != "0" ]] || die "dimension tables empty — run ./scripts/replay.sh --dims first"
+  reload_dicts
+  echo "   dictionaries synced before data replay"
   log "replaying ${AD_EVENTS_FILE}"
   echo "   MV1 will populate ad_events_enriched on insert"
   START=$(date +%s)
@@ -171,6 +186,41 @@ if (( DO_DATA )); then
             --data-binary @- < "$AD_EVENTS_FILE" 2>&1) || die "shifted load failed: ${OUT}"
   fi
   echo "   done in $(( $(date +%s) - START ))s"
+fi
+
+# ---------------------------------------------------- rebuild silver
+# Re-run JOIN enrichment over existing bronze without re-loading parquet.
+# Use after changing mv_ad_events_enriched (dictGet → JOIN fix, etc.).
+backfill_silver() {
+  log "rebuilding ad_events_enriched from ad_events (JOIN enrichment)"
+  ch_sql "TRUNCATE TABLE ${DB}.ad_events_enriched" >/dev/null
+  ch_sql "
+INSERT INTO ${DB}.ad_events_enriched
+SELECT
+    e.event_time, e.app_id, e.geo_device_id, e.advertiser_id, e.ad_format,
+    e.is_filled, e.is_impression, e.is_click, e.revenue,
+    coalesce(a.category, 'unknown'),
+    coalesce(a.publisher_tier, 'unknown'),
+    coalesce(g.region, 'unknown'),
+    coalesce(g.country, 'unknown'),
+    coalesce(g.device_model, 'unknown'),
+    coalesce(g.os_version, 'unknown'),
+    if(e.advertiser_id = '', '', coalesce(ad.vertical, 'unknown')),
+    if(e.advertiser_id = '', '', coalesce(ad.campaign_type, 'unknown'))
+FROM ${DB}.ad_events AS e
+LEFT JOIN ${DB}.apps AS a ON e.app_id = a.app_id
+LEFT JOIN ${DB}.geo_device AS g ON e.geo_device_id = g.geo_device_id
+LEFT JOIN ${DB}.advertisers AS ad
+    ON e.advertiser_id = ad.advertiser_id AND e.advertiser_id != ''" >/dev/null
+  echo "   silver backfill complete"
+}
+
+if (( DO_REBUILD_SILVER )); then
+  APPS_N=$(ch_sql "SELECT count() FROM ${DB}.apps" | tr -d '[:space:]')
+  [[ "$APPS_N" != "0" ]] || die "dimension tables empty — run ./scripts/replay.sh --dims first"
+  EVENTS_N=$(ch_sql "SELECT count() FROM ${DB}.ad_events" | tr -d '[:space:]')
+  [[ "$EVENTS_N" != "0" ]] || die "ad_events empty — run ./scripts/replay.sh --data first"
+  backfill_silver
 fi
 
 # ---------------------------------------------------------- verify

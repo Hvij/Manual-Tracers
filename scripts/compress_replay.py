@@ -79,13 +79,49 @@ def main() -> int:
     bounds = query(
         env,
         "SELECT toUnixTimestamp(min(event_time)) AS start, "
+        "toUnixTimestamp(max(event_time)) AS finish, "
         "toDayOfWeek(min(event_time)) AS iso_dow, "
-        "dateDiff('hour', min(event_time), max(event_time)) + 1 AS hours "
+        "dateDiff('hour', min(event_time), max(event_time)) + 1 AS calendar_hours "
         "FROM inmobi.ad_events FORMAT JSONEachRow",
     )[0]
     data_start = int(bounds["start"])
-    origin_dow = int(bounds["iso_dow"]) - 1  # ClickHouse: 1=Mon..7=Sun -> 0=Mon..6=Sun
-    total_hours = int(bounds["hours"])
+    span = int(bounds["finish"]) - data_start
+
+    prior = query(
+        env,
+        "SELECT bucket_seconds, anchor, origin_dow FROM inmobi.replay_clock "
+        "FINAL LIMIT 1 FORMAT JSONEachRow",
+    )
+    prior = prior[0] if prior else {"bucket_seconds": 3600, "anchor": 0, "origin_dow": 0}
+
+    # Is what is already in ad_events real-time or a previous compression?
+    #
+    # This matters because the script has to be re-runnable: the sealed dataset arrives late,
+    # the demo pace gets retuned, and neither can require a full reload first. Deriving the
+    # data-hour index as (event_time - min)/3600 is only correct on real-time rows — run it
+    # over an already-compressed replay, where a whole data-hour is one second, and intDiv by
+    # 3600 collapses all 840 buckets into one.
+    #
+    # A previous compression is recognisable: its whole span is shorter than the calendar
+    # hours it claims to cover. Inverting it is exact, because replay_clock records the anchor
+    # and bucket size that produced it.
+    compressed_input = span < int(bounds["calendar_hours"]) * 3600 // 2
+    if compressed_input:
+        prior_size, prior_anchor = int(prior["bucket_seconds"]), int(prior["anchor"])
+        hour_index = f"intDiv(toUnixTimestamp(event_time) - {prior_anchor}, {prior_size})"
+        total_hours = span // prior_size + 1
+        # Cannot be re-read off a compressed calendar, where a data-day may occupy 24
+        # seconds — carry forward what the original load recorded.
+        origin_dow = int(prior["origin_dow"])
+        print(
+            f"input is already compressed (bucket_seconds={prior_size}, span={span}s) — "
+            f"inverting via replay_clock rather than re-reading the calendar"
+        )
+    else:
+        hour_index = f"intDiv(toUnixTimestamp(event_time) - {data_start}, 3600)"
+        total_hours = int(bounds["calendar_hours"])
+        origin_dow = int(bounds["iso_dow"]) - 1  # ClickHouse 1=Mon..7=Sun -> 0=Mon..6=Sun
+
     window_seconds = total_hours * bucket_seconds
 
     print(
@@ -114,8 +150,7 @@ def main() -> int:
         f"""
 INSERT INTO inmobi.ad_events
 SELECT
-    toDateTime64({anchor} + intDiv(toUnixTimestamp(event_time) - {data_start}, 3600)
-                 * {bucket_seconds}, 3) AS event_time,
+    toDateTime64({anchor} + ({hour_index}) * {bucket_seconds}, 3) AS event_time,
     app_id, geo_device_id, advertiser_id, ad_format,
     is_filled, is_impression, is_click, revenue
 FROM inmobi.ad_events_staging
@@ -144,6 +179,11 @@ FROM inmobi.ad_events_staging
     print(
         f"replay_clock: bucket_seconds={bucket_seconds} anchor={anchor} origin_dow={origin_dow}"
     )
+    # The agent re-reads replay_clock per query, so it needs nothing. HyperDX tiles do not:
+    # metric_sql bakes the bucket/hour/weekend expressions into the query text at render
+    # time, so every saved tile is still scoring on the previous clock until re-rendered.
+    print("\nNEXT: ./scripts/provision_alerts.py --apply   (tiles are rendered against the")
+    print("      clock and are now stale — they will score the old buckets until re-pushed)")
     return 0
 
 
